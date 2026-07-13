@@ -2,3 +2,4 @@
 *.npz binary
 *.png binary
 *.pdf binary
+*.tiff binary

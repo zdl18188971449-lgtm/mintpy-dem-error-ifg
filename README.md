@@ -218,3 +218,13 @@ python run_published_models_on_mintpy.py \
 See [`HYBRID_OPTIMAL_2026.md`](HYBRID_OPTIMAL_2026.md) for the model-selection
 equations, HDF5 diagnostics, benchmark results, ablation plan, and publication
 limitations.
+
+Generate the IEEE TGRS-style spatial and performance comparison figures with:
+
+```bash
+python plot_tgrs_hybrid_comparison.py published_model_benchmark --dpi 600
+```
+
+See [`TGRS_FIGURE_NOTES.md`](TGRS_FIGURE_NOTES.md) for manuscript-ready
+captions, method differences, quantitative interpretation, and validation
+limits.

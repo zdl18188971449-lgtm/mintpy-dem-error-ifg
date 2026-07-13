@@ -323,6 +323,7 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
     temporal_design, _ = current.build_deformation_design(date_pairs, 1)
     velocity = 1.1 * _normalize(gaussian_filter(rng.normal(size=(size, size)), size / 8.0)).reshape(-1)
     wrapped_truth = 0.75 * truth.reshape(-1)
+    maps["wrapped_truth"] = wrapped_truth.reshape(size, size)
     clean_wrapped_phase = coefficient * wrapped_truth[None, :]
     clean_wrapped_phase += temporal_design[:, :1] @ velocity[None, :]
     noisy_unwrapped = clean_wrapped_phase + rng.normal(0.0, 0.02, clean_wrapped_phase.shape)
@@ -366,6 +367,7 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
     start = time.perf_counter()
     wrapped_linear_huber = _linear_huber(noisy_unwrapped, coefficient, date_pairs, weights)
     runtime = time.perf_counter() - start
+    maps["wrapped_linear"] = wrapped_linear_huber.reshape(size, size)
     _append_result(
         rows,
         "wrapped_linear",
