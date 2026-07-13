@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local papers and extracted source text are not redistributed.
+reference_paper/
+
+# Third-party source checkout used only as a local simulation reference.
+InterferogramSimulator-main/
+
+# Large reproducible intermediate products.
+synthetic_benchmark/
+multi_terrain_benchmark/
+multi_terrain_no_outlier/
+test_output/
+dem_error_ifg*/
+
+# Broken/duplicate local extraction artifacts; the validated fixture files are
+# already tracked at test_data/HFT473_16x16/*.h5.
+test_data/*/inputs/
+test_data/*/coherenceSpatialAvg.txt

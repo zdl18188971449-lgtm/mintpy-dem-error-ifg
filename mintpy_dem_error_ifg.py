@@ -28,6 +28,8 @@ class ModelSpec:
     poly_order: int
     solver: str
     phase_velocity: bool = False
+    adaptive: bool = False
+    graph_regularized: bool = False
 
 
 MODEL_SPECS = {
@@ -40,6 +42,13 @@ MODEL_SPECS = {
     "quadratic_huber": ModelSpec("quadratic_huber", 2, "huber"),
     "linear_vce": ModelSpec("linear_vce", 1, "vce"),
     "quadratic_vce": ModelSpec("quadratic_vce", 2, "vce"),
+    "adaptive_vce_huber_graph": ModelSpec(
+        "adaptive_vce_huber_graph",
+        2,
+        "adaptive_graph",
+        adaptive=True,
+        graph_regularized=True,
+    ),
 }
 
 
@@ -90,7 +99,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--variance-file",
-        help="vceSAR-compatible variance HDF5 required by *_vce models",
+        help="vceSAR-compatible variance HDF5 required by *_vce and adaptive graph models",
     )
     parser.add_argument(
         "--variance-dataset",
@@ -105,6 +114,36 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-rows", type=int, default=8)
     parser.add_argument("--huber-delta", type=float, default=1.345)
     parser.add_argument("--huber-iterations", type=int, default=5)
+    parser.add_argument(
+        "--adaptive-bic-margin",
+        type=float,
+        default=2.0,
+        help="BIC improvement required before selecting quadratic deformation",
+    )
+    parser.add_argument(
+        "--graph-lambda",
+        type=float,
+        default=8.0,
+        help="Strength of observability-adaptive terrain graph regularization",
+    )
+    parser.add_argument(
+        "--graph-iterations",
+        type=int,
+        default=40,
+        help="Number of iteratively reweighted graph updates",
+    )
+    parser.add_argument(
+        "--graph-height-scale",
+        type=float,
+        default=0.0,
+        help="Terrain edge scale in meters; zero selects it from the geometry",
+    )
+    parser.add_argument(
+        "--graph-error-scale",
+        type=float,
+        default=0.0,
+        help="DEM-error edge scale in meters; zero selects it from the initial estimate",
+    )
     parser.add_argument("--rcond", type=float, default=1e-8)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
@@ -457,6 +496,307 @@ def solve_model_block(
     return solution, valid
 
 
+def robust_model_statistics(
+    phase: np.ndarray,
+    dem_coefficient: np.ndarray,
+    deformation_design: np.ndarray,
+    fit_ifgrams: np.ndarray,
+    base_weights: np.ndarray,
+    solution: np.ndarray,
+    huber_delta: float,
+    rcond: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return robust BIC, DEM information, and local DEM standard deviation."""
+    phase_fit = np.asarray(phase[fit_ifgrams].T, dtype=np.float64)
+    dem_fit = np.asarray(dem_coefficient[fit_ifgrams].T, dtype=np.float64)
+    deformation_fit = np.asarray(deformation_design[fit_ifgrams], dtype=np.float64)
+    weights = np.asarray(base_weights[fit_ifgrams].T, dtype=np.float64)
+    num_pixel, num_ifgram = phase_fit.shape
+    num_param = 1 + deformation_fit.shape[1]
+
+    design = np.empty((num_pixel, num_ifgram, num_param), dtype=np.float64)
+    design[:, :, 0] = dem_fit
+    design[:, :, 1:] = deformation_fit[None, :, :]
+    finite = (
+        np.isfinite(phase_fit)
+        & np.isfinite(dem_fit)
+        & np.isfinite(weights)
+        & np.all(np.isfinite(solution), axis=1)[:, None]
+    )
+    weights = np.where(finite & (weights > 0), weights, 0.0)
+    observations = np.where(finite, phase_fit, 0.0)
+    design = np.where(finite[:, :, None], design, 0.0)
+
+    prediction = np.einsum("pmq,pq->pm", design, np.nan_to_num(solution), optimize=True)
+    residual = observations - prediction
+    residual_for_scale = np.where(weights > 0, residual, np.nan)
+    active = np.any(weights > 0, axis=1)
+    median = np.zeros((num_pixel, 1), dtype=np.float64)
+    mad = np.zeros((num_pixel, 1), dtype=np.float64)
+    if np.any(active):
+        median[active] = np.nanmedian(
+            residual_for_scale[active], axis=1, keepdims=True
+        )
+        mad[active] = np.nanmedian(
+            np.abs(residual_for_scale[active] - median[active]),
+            axis=1,
+            keepdims=True,
+        )
+    scale = np.maximum(1.4826 * mad, 1e-6)
+    ratio = np.abs(residual) / (huber_delta * scale)
+    huber_weight = np.ones_like(ratio)
+    large = ratio > 1.0
+    huber_weight[large] = 1.0 / ratio[large]
+    huber_weight[~np.isfinite(huber_weight)] = 0.0
+    effective_weights = weights * huber_weight
+
+    observation_count = np.sum(effective_weights > 0, axis=1)
+    rss = np.sum(effective_weights * residual**2, axis=1)
+    bic = np.full(num_pixel, np.inf, dtype=np.float64)
+    information = np.zeros(num_pixel, dtype=np.float64)
+    standard_deviation = np.full(num_pixel, np.nan, dtype=np.float64)
+    candidates = np.flatnonzero(
+        (observation_count > num_param) & np.all(np.isfinite(solution), axis=1)
+    )
+    if candidates.size == 0:
+        return bic, information, standard_deviation
+
+    normal = np.einsum(
+        "pmq,pm,pmr->pqr",
+        design[candidates],
+        effective_weights[candidates],
+        design[candidates],
+        optimize=True,
+    )
+    inverse = np.linalg.pinv(normal, rcond=rcond)
+    dem_variance_factor = inverse[:, 0, 0]
+    usable = np.isfinite(dem_variance_factor) & (dem_variance_factor > 0)
+    selected_candidates = candidates[usable]
+    if selected_candidates.size == 0:
+        return bic, information, standard_deviation
+
+    variance_factor = dem_variance_factor[usable]
+    dof = np.maximum(observation_count[selected_candidates] - num_param, 1)
+    residual_variance = rss[selected_candidates] / dof
+    standard_deviation[selected_candidates] = np.sqrt(
+        np.maximum(residual_variance * variance_factor, 0.0)
+    )
+    information[selected_candidates] = 1.0 / variance_factor
+    mean_square = np.maximum(
+        rss[selected_candidates] / observation_count[selected_candidates], 1e-18
+    )
+    bic[selected_candidates] = (
+        observation_count[selected_candidates] * np.log(mean_square)
+        + num_param * np.log(observation_count[selected_candidates])
+    )
+    return bic, information, standard_deviation
+
+
+def solve_adaptive_model_block(
+    phase: np.ndarray,
+    dem_coefficient: np.ndarray,
+    date_pairs: list[tuple[str, str]],
+    fit_ifgrams: np.ndarray,
+    base_weights: np.ndarray,
+    periods: list[float] | None = None,
+    step_dates: list[str] | None = None,
+    bic_margin: float = 2.0,
+    huber_delta: float = 1.345,
+    huber_iterations: int = 5,
+    rcond: float = 1e-8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """Robustly select linear or quadratic deformation independently per pixel."""
+    linear_design, linear_labels = build_deformation_design(
+        date_pairs, 1, periods, step_dates
+    )
+    quadratic_design, quadratic_labels = build_deformation_design(
+        date_pairs, 2, periods, step_dates
+    )
+    linear_solution, linear_valid = solve_model_block(
+        phase,
+        dem_coefficient,
+        linear_design,
+        fit_ifgrams,
+        base_weights,
+        robust=True,
+        huber_delta=huber_delta,
+        huber_iterations=huber_iterations,
+        rcond=rcond,
+    )
+    quadratic_solution, quadratic_valid = solve_model_block(
+        phase,
+        dem_coefficient,
+        quadratic_design,
+        fit_ifgrams,
+        base_weights,
+        robust=True,
+        huber_delta=huber_delta,
+        huber_iterations=huber_iterations,
+        rcond=rcond,
+    )
+    linear_bic, linear_information, linear_std = robust_model_statistics(
+        phase,
+        dem_coefficient,
+        linear_design,
+        fit_ifgrams,
+        base_weights,
+        linear_solution,
+        huber_delta,
+        rcond,
+    )
+    quadratic_bic, quadratic_information, quadratic_std = robust_model_statistics(
+        phase,
+        dem_coefficient,
+        quadratic_design,
+        fit_ifgrams,
+        base_weights,
+        quadratic_solution,
+        huber_delta,
+        rcond,
+    )
+
+    choose_quadratic = quadratic_valid & (
+        ~linear_valid | ((quadratic_bic + bic_margin) < linear_bic)
+    )
+    valid = linear_valid | quadratic_valid
+    num_pixel = phase.shape[1]
+    solution = np.full(
+        (num_pixel, 1 + quadratic_design.shape[1]), np.nan, dtype=np.float64
+    )
+    linear_pixels = valid & ~choose_quadratic
+    solution[linear_pixels, 0] = linear_solution[linear_pixels, 0]
+    for source_index, label in enumerate(linear_labels, start=1):
+        target_index = 1 + quadratic_labels.index(label)
+        solution[linear_pixels, target_index] = linear_solution[
+            linear_pixels, source_index
+        ]
+    linear_coefficients = solution[linear_pixels, 1:]
+    solution[linear_pixels, 1:] = np.nan_to_num(linear_coefficients)
+    solution[choose_quadratic] = quadratic_solution[choose_quadratic]
+
+    information = np.where(
+        choose_quadratic, quadratic_information, linear_information
+    )
+    standard_deviation = np.where(choose_quadratic, quadratic_std, linear_std)
+    model_order = np.zeros(num_pixel, dtype=np.uint8)
+    model_order[linear_pixels] = 1
+    model_order[choose_quadratic] = 2
+    return solution, valid, information, standard_deviation, model_order, quadratic_labels
+
+
+def terrain_graph_regularize(
+    initial_dem: np.ndarray,
+    information: np.ndarray,
+    terrain: np.ndarray,
+    valid_mask: np.ndarray,
+    regularization: float,
+    iterations: int,
+    height_scale: float = 0.0,
+    error_scale: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Solve an observability-adaptive, terrain-edge-preserving graph problem."""
+    valid = (
+        np.asarray(valid_mask, dtype=bool)
+        & np.isfinite(initial_dem)
+        & np.isfinite(information)
+        & (information > 0)
+        & np.isfinite(terrain)
+    )
+    result = np.asarray(initial_dem, dtype=np.float64).copy()
+    normalized_information = np.zeros_like(result)
+    if not np.any(valid):
+        result[~valid] = np.nan
+        return result, normalized_information
+
+    median_information = np.median(information[valid])
+    normalized_information[valid] = np.clip(
+        information[valid] / max(median_information, 1e-12), 0.05, 20.0
+    )
+    if regularization <= 0 or iterations <= 0:
+        result[~valid] = np.nan
+        return result, normalized_information
+
+    terrain = np.asarray(terrain, dtype=np.float64)
+    terrain_slope = np.hypot(*np.gradient(terrain))
+    horizontal_height = np.abs(terrain[:, 1:] - terrain[:, :-1])
+    vertical_height = np.abs(terrain[1:, :] - terrain[:-1, :])
+    height_values = np.concatenate(
+        [horizontal_height[np.isfinite(horizontal_height)], vertical_height[np.isfinite(vertical_height)]]
+    )
+    if height_scale <= 0:
+        height_scale = max(float(np.percentile(height_values, 70.0)), 1.0)
+    horizontal_slope = np.abs(terrain_slope[:, 1:] - terrain_slope[:, :-1])
+    vertical_slope = np.abs(terrain_slope[1:, :] - terrain_slope[:-1, :])
+    slope_values = np.concatenate(
+        [horizontal_slope[np.isfinite(horizontal_slope)], vertical_slope[np.isfinite(vertical_slope)]]
+    )
+    slope_scale = max(float(np.percentile(slope_values, 70.0)), 0.5)
+
+    horizontal_valid = valid[:, 1:] & valid[:, :-1]
+    vertical_valid = valid[1:, :] & valid[:-1, :]
+    horizontal_terrain_weight = np.exp(
+        -horizontal_height / height_scale - horizontal_slope / slope_scale
+    ) * horizontal_valid
+    vertical_terrain_weight = np.exp(
+        -vertical_height / height_scale - vertical_slope / slope_scale
+    ) * vertical_valid
+
+    edge_values = np.concatenate(
+        [
+            np.abs(result[:, 1:] - result[:, :-1])[horizontal_valid],
+            np.abs(result[1:, :] - result[:-1, :])[vertical_valid],
+        ]
+    )
+    if edge_values.size == 0:
+        result[~valid] = np.nan
+        return result, normalized_information
+    if error_scale <= 0:
+        error_scale = max(float(np.percentile(edge_values, 70.0)), 0.5)
+
+    source = result.copy()
+    for _ in range(iterations):
+        horizontal_difference = result[:, 1:] - result[:, :-1]
+        vertical_difference = result[1:, :] - result[:-1, :]
+        horizontal_weight = np.where(
+            horizontal_valid,
+            horizontal_terrain_weight
+            / np.sqrt(1.0 + (horizontal_difference / error_scale) ** 2),
+            0.0,
+        )
+        vertical_weight = np.where(
+            vertical_valid,
+            vertical_terrain_weight
+            / np.sqrt(1.0 + (vertical_difference / error_scale) ** 2),
+            0.0,
+        )
+
+        neighbor_sum = np.zeros_like(result)
+        weight_sum = np.zeros_like(result)
+        finite_result = np.nan_to_num(result)
+        neighbor_sum[:, :-1] += horizontal_weight * finite_result[:, 1:]
+        neighbor_sum[:, 1:] += horizontal_weight * finite_result[:, :-1]
+        weight_sum[:, :-1] += horizontal_weight
+        weight_sum[:, 1:] += horizontal_weight
+        neighbor_sum[:-1, :] += vertical_weight * finite_result[1:, :]
+        neighbor_sum[1:, :] += vertical_weight * finite_result[:-1, :]
+        weight_sum[:-1, :] += vertical_weight
+        weight_sum[1:, :] += vertical_weight
+
+        denominator = normalized_information + regularization * weight_sum
+        updated = np.divide(
+            normalized_information * source + regularization * neighbor_sum,
+            denominator,
+            out=result.copy(),
+            where=valid & (denominator > 0),
+        )
+        change = np.nanmax(np.abs(updated[valid] - result[valid]))
+        result = updated
+        if change < 1e-4:
+            break
+    result[~valid] = np.nan
+    return result, normalized_information
+
+
 def inspect_baseline_mode(
     stack: h5py.File, geometry: h5py.File, date_pairs: list[tuple[str, str]]
 ) -> tuple[str, object]:
@@ -577,6 +917,19 @@ def get_base_weights(
         else:
             variance = np.asarray(source[:, row_slice, :], dtype=np.float64).reshape(num_ifgram, -1)
         weights *= np.divide(1.0, variance, out=np.zeros_like(variance), where=variance > 0)
+    elif spec.solver == "adaptive_graph":
+        if vce_source is None:
+            raise ValueError(f"{spec.name} requires --variance-file")
+        if coh is not None:
+            coh_clip = np.clip(coh, 1e-3, 0.999)
+            phase_weight = coh_clip**2 / np.maximum(1.0 - coh_clip**2, 1e-6)
+            weights *= np.clip(phase_weight, 0.0, 1e3)
+        mode, source = vce_source
+        if mode == "vector":
+            variance = np.broadcast_to(source[:, None], weights.shape)
+        else:
+            variance = np.asarray(source[:, row_slice, :], dtype=np.float64).reshape(num_ifgram, -1)
+        weights *= np.divide(1.0, variance, out=np.zeros_like(variance), where=variance > 0)
 
     return weights
 
@@ -662,6 +1015,289 @@ def print_diagnostics(diagnostics: dict) -> None:
             print(f"  WARNING: model {name} is rank deficient")
 
 
+def run_adaptive_graph_model(
+    args: argparse.Namespace,
+    stack: h5py.File,
+    geometry: h5py.File,
+    phase_source: h5py.Dataset,
+    coherence_source: h5py.Dataset | None,
+    mask_handle: h5py.File | None,
+    mask_dataset: str | None,
+    vce_source,
+    output_dir: Path,
+    spec: ModelSpec,
+    date_pairs: list[tuple[str, str]],
+    selected: np.ndarray,
+    baseline_mode: str,
+    baseline_source,
+    range_to_phase: float,
+) -> tuple[list[Path], dict]:
+    """Run adaptive robust inversion followed by terrain graph regularization."""
+    if vce_source is None:
+        raise ValueError(f"{spec.name} requires --variance-file")
+    num_ifgram, length, width = phase_source.shape
+    deformation_design, deformation_labels = build_deformation_design(
+        date_pairs, 2, args.periodic, args.step_date
+    )
+    num_solution = 1 + deformation_design.shape[1]
+    solution_map = np.full((length, width, num_solution), np.nan, dtype=np.float64)
+    information_map = np.zeros((length, width), dtype=np.float64)
+    standard_deviation_map = np.full((length, width), np.nan, dtype=np.float64)
+    model_order_map = np.zeros((length, width), dtype=np.uint8)
+    initial_valid_map = np.zeros((length, width), dtype=bool)
+
+    (
+        corrected_file,
+        corrected_phase,
+        component_file,
+        dem_phase_output,
+        dem_error_output,
+        corrected_path,
+        component_path,
+    ) = prepare_output_files(stack, output_dir, spec, "unwrapPhase", args.overwrite)
+    for output_file in (corrected_file, component_file):
+        output_file.attrs["DEM_ERROR_POLY_ORDER"] = "adaptive_1_or_2"
+        output_file.attrs["DEM_ERROR_SOLVER"] = spec.solver
+        output_file.attrs["DEM_ERROR_ADAPTIVE_BIC_MARGIN"] = args.adaptive_bic_margin
+        output_file.attrs["DEM_ERROR_GRAPH_LAMBDA"] = args.graph_lambda
+        output_file.attrs["DEM_ERROR_GRAPH_ITERATIONS"] = args.graph_iterations
+        output_file.attrs["DEM_ERROR_PERIODIC_YEARS"] = str(args.periodic)
+        output_file.attrs["DEM_ERROR_STEP_DATES"] = str(args.step_date)
+        output_file.attrs["DEM_ERROR_FIT_IFGRAMS"] = int(np.sum(selected))
+
+    print(f"\nmodel: {spec.name}")
+    try:
+        for y0 in range(0, length, args.block_rows):
+            y1 = min(length, y0 + args.block_rows)
+            row_slice = slice(y0, y1)
+            phase = np.asarray(
+                phase_source[:, row_slice, :], dtype=np.float64
+            ).reshape(num_ifgram, -1)
+            incidence = np.asarray(
+                geometry["incidenceAngle"][row_slice, :], dtype=np.float64
+            ).reshape(-1)
+            slant_range = np.asarray(
+                geometry["slantRangeDistance"][row_slice, :], dtype=np.float64
+            ).reshape(-1)
+            sine_incidence = np.sin(np.deg2rad(incidence))
+            inverse_geometry = np.divide(
+                1.0,
+                slant_range * sine_incidence,
+                out=np.full_like(slant_range, np.nan),
+                where=(slant_range > 0) & (sine_incidence != 0),
+            )
+            bperp = read_bperp_block(
+                baseline_mode,
+                baseline_source,
+                geometry,
+                date_pairs,
+                row_slice,
+                width,
+            )
+            dem_coefficient = range_to_phase * bperp * inverse_geometry[None, :]
+            weights = get_base_weights(
+                spec,
+                coherence_source,
+                vce_source,
+                row_slice,
+                phase_source.shape,
+                args.min_coherence,
+            )
+            spatial_mask = read_mask_block(mask_handle, mask_dataset, row_slice, width)
+            spatial_mask &= np.isfinite(inverse_geometry)
+            spatial_mask &= ~np.all((phase == 0) | ~np.isfinite(phase), axis=0)
+            weights[:, ~spatial_mask] = 0.0
+
+            solution, valid, information, standard_deviation, order, labels = (
+                solve_adaptive_model_block(
+                    phase,
+                    dem_coefficient,
+                    date_pairs,
+                    selected,
+                    weights,
+                    periods=args.periodic,
+                    step_dates=args.step_date,
+                    bic_margin=args.adaptive_bic_margin,
+                    huber_delta=args.huber_delta,
+                    huber_iterations=args.huber_iterations,
+                    rcond=args.rcond,
+                )
+            )
+            if labels != deformation_labels:
+                raise RuntimeError("adaptive deformation labels changed unexpectedly")
+            solution_map[y0:y1] = solution.reshape(y1 - y0, width, num_solution)
+            information_map[y0:y1] = information.reshape(y1 - y0, width)
+            standard_deviation_map[y0:y1] = standard_deviation.reshape(y1 - y0, width)
+            model_order_map[y0:y1] = order.reshape(y1 - y0, width)
+            initial_valid_map[y0:y1] = valid.reshape(y1 - y0, width)
+            print(f"  inversion rows {y0}:{y1}, valid pixels {int(np.sum(valid))}")
+
+        if "height" in geometry:
+            terrain = np.asarray(geometry["height"][:], dtype=np.float64)
+            terrain_source = "geometry.height"
+        else:
+            terrain = np.zeros((length, width), dtype=np.float64)
+            terrain_source = "uniform_fallback"
+            print("  WARNING: geometry has no height dataset; using uniform graph edges")
+        regularized_dem, normalized_information = terrain_graph_regularize(
+            solution_map[:, :, 0],
+            information_map,
+            terrain,
+            initial_valid_map,
+            args.graph_lambda,
+            args.graph_iterations,
+            args.graph_height_scale,
+            args.graph_error_scale,
+        )
+        final_valid_map = np.isfinite(regularized_dem)
+        solution_map[:, :, 0] = regularized_dem
+        dem_error_output[:] = regularized_dem.astype(np.float32)
+        dem_error_output.attrs["REGULARIZATION"] = "observability_adaptive_terrain_graph"
+        component_file.attrs["DEM_ERROR_TERRAIN_SOURCE"] = terrain_source
+        std_output = component_file.create_dataset(
+            "demErrorStd",
+            data=standard_deviation_map.astype(np.float32),
+            chunks=True,
+            compression="gzip",
+            compression_opts=4,
+        )
+        std_output.attrs["UNIT"] = "m"
+        std_output.attrs["DESCRIPTION"] = "local robust approximation before graph regularization"
+        observation_output = component_file.create_dataset(
+            "demObservability",
+            data=normalized_information.astype(np.float32),
+            chunks=True,
+            compression="gzip",
+            compression_opts=4,
+        )
+        observation_output.attrs["DESCRIPTION"] = "Fisher information normalized to median 1"
+        order_output = component_file.create_dataset(
+            "deformationModelOrder",
+            data=model_order_map,
+            chunks=True,
+            compression="gzip",
+            compression_opts=4,
+        )
+        order_output.attrs["DESCRIPTION"] = "0 invalid, 1 linear, 2 quadratic"
+
+        sum_original2 = np.zeros(num_ifgram, dtype=np.float64)
+        sum_corrected2 = np.zeros(num_ifgram, dtype=np.float64)
+        sum_component2 = np.zeros(num_ifgram, dtype=np.float64)
+        sum_residual2 = np.zeros(num_ifgram, dtype=np.float64)
+        metric_count = np.zeros(num_ifgram, dtype=np.int64)
+        for y0 in range(0, length, args.block_rows):
+            y1 = min(length, y0 + args.block_rows)
+            row_slice = slice(y0, y1)
+            phase = np.asarray(
+                phase_source[:, row_slice, :], dtype=np.float64
+            ).reshape(num_ifgram, -1)
+            incidence = np.asarray(
+                geometry["incidenceAngle"][row_slice, :], dtype=np.float64
+            ).reshape(-1)
+            slant_range = np.asarray(
+                geometry["slantRangeDistance"][row_slice, :], dtype=np.float64
+            ).reshape(-1)
+            inverse_geometry = 1.0 / (
+                slant_range * np.sin(np.deg2rad(incidence))
+            )
+            bperp = read_bperp_block(
+                baseline_mode,
+                baseline_source,
+                geometry,
+                date_pairs,
+                row_slice,
+                width,
+            )
+            dem_coefficient = range_to_phase * bperp * inverse_geometry[None, :]
+            solution = solution_map[y0:y1].reshape(-1, num_solution)
+            valid = final_valid_map[y0:y1].reshape(-1)
+            component = np.zeros_like(phase)
+            component[:, valid] = (
+                dem_coefficient[:, valid] * solution[valid, 0][None, :]
+            )
+            corrected = phase - component
+            prediction = component.copy()
+            if np.any(valid):
+                prediction[:, valid] += deformation_design @ solution[valid, 1:].T
+            residual = phase - prediction
+            metric_mask = np.isfinite(phase) & valid[None, :]
+            sum_original2 += np.sum(np.where(metric_mask, phase**2, 0.0), axis=1)
+            sum_corrected2 += np.sum(np.where(metric_mask, corrected**2, 0.0), axis=1)
+            sum_component2 += np.sum(np.where(metric_mask, component**2, 0.0), axis=1)
+            sum_residual2 += np.sum(np.where(metric_mask, residual**2, 0.0), axis=1)
+            metric_count += np.sum(metric_mask, axis=1)
+            corrected_phase[:, row_slice, :] = corrected.reshape(
+                num_ifgram, y1 - y0, width
+            ).astype(np.float32)
+            dem_phase_output[:, row_slice, :] = component.reshape(
+                num_ifgram, y1 - y0, width
+            ).astype(np.float32)
+            print(f"  reconstruction rows {y0}:{y1}, valid pixels {int(np.sum(valid))}")
+    finally:
+        corrected_file.close()
+        component_file.close()
+
+    original_rms = np.full(num_ifgram, np.nan, dtype=np.float64)
+    corrected_rms = np.full(num_ifgram, np.nan, dtype=np.float64)
+    component_rms = np.full(num_ifgram, np.nan, dtype=np.float64)
+    residual_rms = np.full(num_ifgram, np.nan, dtype=np.float64)
+    has_metrics = metric_count > 0
+    original_rms[has_metrics] = np.sqrt(sum_original2[has_metrics] / metric_count[has_metrics])
+    corrected_rms[has_metrics] = np.sqrt(sum_corrected2[has_metrics] / metric_count[has_metrics])
+    component_rms[has_metrics] = np.sqrt(sum_component2[has_metrics] / metric_count[has_metrics])
+    residual_rms[has_metrics] = np.sqrt(sum_residual2[has_metrics] / metric_count[has_metrics])
+    metrics_path = output_dir / f"ifgram_metrics_{spec.name}.csv"
+    with metrics_path.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        writer.writerow(
+            [
+                "master",
+                "slave",
+                "fit_used",
+                "valid_pixels",
+                "original_rms_rad",
+                "corrected_rms_rad",
+                "dem_component_rms_rad",
+                "model_residual_rms_rad",
+            ]
+        )
+        for idx, (master, slave) in enumerate(date_pairs):
+            writer.writerow(
+                [
+                    master,
+                    slave,
+                    int(selected[idx]),
+                    int(metric_count[idx]),
+                    original_rms[idx],
+                    corrected_rms[idx],
+                    component_rms[idx],
+                    residual_rms[idx],
+                ]
+            )
+
+    final_values = regularized_dem[final_valid_map]
+    final_std = standard_deviation_map[final_valid_map]
+    final_observability = normalized_information[final_valid_map]
+    final_orders = model_order_map[final_valid_map]
+    summary = {
+        "model": spec.name,
+        "poly_order": "adaptive_1_or_2",
+        "solver": spec.solver,
+        "phase_velocity": 0,
+        "num_parameters": 1 + len(deformation_labels),
+        "valid_dem_pixels": int(final_values.size),
+        "dem_error_mean_m": float(np.mean(final_values)),
+        "dem_error_std_m": float(np.std(final_values)),
+        "mean_model_residual_rms_rad": float(np.nanmean(residual_rms)),
+        "adaptive_quadratic_fraction": float(np.mean(final_orders == 2)),
+        "mean_dem_error_std_m": float(np.nanmean(final_std)),
+        "mean_observability": float(np.nanmean(final_observability)),
+        "corrected_stack": corrected_path.name,
+        "component_file": component_path.name,
+    }
+    return [corrected_path, component_path, metrics_path], summary
+
+
 def run(args: argparse.Namespace) -> list[Path]:
     input_path = Path(args.ifgram_stack).resolve()
     geometry_path = Path(args.geometry).resolve()
@@ -670,6 +1306,12 @@ def run(args: argparse.Namespace) -> list[Path]:
         raise ValueError("--block-rows must be positive")
     if not 0 <= args.min_coherence < 1:
         raise ValueError("--min-coherence must be in [0, 1)")
+    if args.adaptive_bic_margin < 0:
+        raise ValueError("--adaptive-bic-margin must be non-negative")
+    if args.graph_lambda < 0:
+        raise ValueError("--graph-lambda must be non-negative")
+    if args.graph_iterations < 0:
+        raise ValueError("--graph-iterations must be non-negative")
 
     mask_handle = h5py.File(args.mask, "r") if args.mask else None
     variance_handle = h5py.File(args.variance_file, "r") if args.variance_file else None
@@ -710,6 +1352,27 @@ def run(args: argparse.Namespace) -> list[Path]:
             summary_rows = []
             for model_name in args.models:
                 spec = MODEL_SPECS[model_name]
+                if spec.solver == "adaptive_graph":
+                    model_paths, model_summary = run_adaptive_graph_model(
+                        args,
+                        stack,
+                        geometry,
+                        phase_source,
+                        coherence_source,
+                        mask_handle,
+                        mask_dataset,
+                        vce_source,
+                        output_dir,
+                        spec,
+                        date_pairs,
+                        selected,
+                        baseline_mode,
+                        baseline_source,
+                        range_to_phase,
+                    )
+                    output_paths.extend(model_paths)
+                    summary_rows.append(model_summary)
+                    continue
                 deformation_design, deformation_labels = build_deformation_design(
                     date_pairs, spec.poly_order, args.periodic, args.step_date
                 )
@@ -891,6 +1554,9 @@ def run(args: argparse.Namespace) -> list[Path]:
                         "dem_error_mean_m": dem_mean,
                         "dem_error_std_m": np.sqrt(max(dem_variance, 0.0)) if dem_count else np.nan,
                         "mean_model_residual_rms_rad": float(np.nanmean(residual_rms)),
+                        "adaptive_quadratic_fraction": np.nan,
+                        "mean_dem_error_std_m": np.nan,
+                        "mean_observability": np.nan,
                         "corrected_stack": corrected_path.name,
                         "component_file": component_path.name,
                     }

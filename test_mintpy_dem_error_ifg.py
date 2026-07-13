@@ -74,6 +74,64 @@ class DemErrorIfgramTest(unittest.TestCase):
         huber_error = np.mean(np.abs(huber[:, 0] - expected))
         self.assertLess(huber_error, ols_error)
 
+    def test_adaptive_solver_selects_quadratic_deformation(self):
+        quadratic_design, _ = MODULE.build_deformation_design(self.date_pairs, 2)
+        bperp = np.asarray([120.0, -240.0, 310.0, -360.0, 190.0, 550.0])
+        coefficient = (-4.0 * np.pi / 0.236) * bperp[:, None]
+        coefficient /= 870000.0 * np.sin(np.deg2rad(39.0))
+        coefficient = np.repeat(coefficient, 12, axis=1)
+        expected = np.linspace(-8.0, 9.0, 12)
+        velocity = np.linspace(-0.02, 0.03, 12)
+        acceleration = np.linspace(-1.0, 1.0, 12)
+        phase = coefficient * expected[None, :]
+        phase += quadratic_design @ np.vstack((velocity, acceleration))
+
+        solution, valid, information, uncertainty, order, labels = (
+            MODULE.solve_adaptive_model_block(
+                phase,
+                coefficient,
+                self.date_pairs,
+                np.ones(len(self.date_pairs), dtype=bool),
+                np.ones_like(phase),
+                huber_iterations=8,
+            )
+        )
+        self.assertTrue(np.all(valid))
+        self.assertEqual(labels, ["velocity", "acceleration"])
+        self.assertTrue(np.all(order == 2))
+        self.assertTrue(np.all(information > 0))
+        self.assertTrue(np.all(np.isfinite(uncertainty)))
+        np.testing.assert_allclose(solution[:, 0], expected, atol=1e-8)
+
+    def test_terrain_graph_reduces_noise_and_preserves_step(self):
+        rng = np.random.default_rng(3)
+        truth = np.zeros((20, 20), dtype=np.float64)
+        truth[:, 10:] = 8.0
+        terrain = np.zeros_like(truth)
+        terrain[:, 10:] = 100.0
+        initial = truth + rng.normal(0.0, 2.0, truth.shape)
+        valid = np.ones_like(truth, dtype=bool)
+        valid[8:12, 8:12] = False
+        initial[~valid] = np.nan
+        regularized, observability = MODULE.terrain_graph_regularize(
+            initial,
+            np.ones_like(truth),
+            terrain,
+            valid,
+            regularization=8.0,
+            iterations=40,
+        )
+        initial_rmse = np.sqrt(np.mean((initial[valid] - truth[valid]) ** 2))
+        regularized_rmse = np.sqrt(
+            np.mean((regularized[valid] - truth[valid]) ** 2)
+        )
+        self.assertLess(regularized_rmse, initial_rmse)
+        self.assertTrue(np.all(np.isfinite(regularized[valid])))
+        self.assertTrue(np.all(np.isnan(regularized[~valid])))
+        self.assertLess(np.abs(np.nanmean(regularized[:, :8])), 0.5)
+        self.assertGreater(np.nanmean(regularized[:, 12:]), 7.5)
+        np.testing.assert_allclose(observability[valid], 1.0)
+
     def test_end_to_end_hdf_output(self):
         deformation, coefficient, expected, phase = self.synthetic_block()
         length, width = 3, 4

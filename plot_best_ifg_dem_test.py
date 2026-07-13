@@ -207,6 +207,11 @@ def main() -> int:
     original[~spatial_mask] = np.nan
     for model_name in args.models:
         spec = module.MODEL_SPECS[model_name]
+        if spec.graph_regularized:
+            raise ValueError(
+                f"{model_name} requires full-resolution terrain/VCE processing; "
+                "run mintpy_dem_error_ifg.py instead"
+            )
         deformation, labels = module.build_deformation_design(
             date_pairs, spec.poly_order
         )

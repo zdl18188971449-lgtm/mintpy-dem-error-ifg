@@ -31,8 +31,23 @@ The tests verify:
 
 - exact recovery of a known DEM-error field in a noise-free system;
 - improved robustness of Huber IRLS when one interferogram contains an outlier;
+- adaptive selection and exact recovery of known quadratic deformation;
+- terrain-graph noise reduction while preserving a sharp elevation boundary;
 - corrected phase and DEM-component HDF5 datasets;
 - optional loading of the corrected stack with MintPy `ifgramStack`.
+
+Run the six published-method numerical tests together with the original suite:
+
+```bash
+python -m unittest -v \
+  test_published_dem_error_models.py \
+  test_mintpy_dem_error_ifg.py
+```
+
+The additional tests cover ICA source recovery and F testing, grouped adaptive
+hypothesis testing, wrapped RI-L1 optimization, PGDC detection/TPC network
+adjustment, dynamic height-change date search, and the adapted fractal
+regularizer.
 
 ## 2. Real 16 x 16 MintPy fixture
 

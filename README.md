@@ -32,6 +32,7 @@ supports polynomial, periodic, and step deformation terms.
 | `linear_wls` / `quadratic_wls` | linear / quadratic | coherence-derived WLS |
 | `linear_huber` / `quadratic_huber` | linear / quadratic | Huber IRLS |
 | `linear_vce` / `quadratic_vce` | linear / quadratic | external vceSAR variance WLS |
+| `adaptive_vce_huber_graph` | per-pixel linear/quadratic BIC selection | VCE + coherence weighting, Huber IRLS, observability-adaptive terrain graph |
 
 Coherence weights use the classic relative phase-variance relation
 `weight proportional to coherence^2 / (1 - coherence^2)`. VCE models accept a
@@ -85,6 +86,25 @@ variance-model files with `vce_modeling.py --model spherical`, `gaussian`, or
 directories. The DEM tool deliberately consumes the variance result instead of
 duplicating vceSAR's variogram fitting code.
 
+The advanced model requires a VCE variance file and a `height` dataset in the
+geometry file for terrain-guided graph edges:
+
+```bash
+python mintpy_dem_error_ifg.py inputs/ifgramStack.h5 \
+  -g inputs/geometryRadar.h5 \
+  --mask maskTempCoh.h5 \
+  --variance-file variogramStackModel.h5 \
+  --variance-dataset model_parameters \
+  --models adaptive_vce_huber_graph \
+  --graph-lambda 8 \
+  -o dem_error_advanced
+```
+
+It first selects linear or quadratic deformation independently at every pixel,
+then regularizes the DEM estimate using normalized Fisher information and
+terrain/DEM-error edge weights. If geometry `height` is absent, the command
+falls back to a uniform spatial graph and prints a warning.
+
 Optional deformation terms:
 
 ```bash
@@ -104,6 +124,11 @@ Each model writes:
 
 Invalid pixels retain their original phase in the corrected stack, receive a
 zero DEM phase component, and are stored as `NaN` in the DEM-error map.
+
+`adaptive_vce_huber_graph` additionally writes `demErrorStd`, normalized
+`demObservability`, and `deformationModelOrder` (`1` linear, `2` quadratic).
+The current standard deviation is a local robust approximation before graph
+regularization; it is not yet a fully calibrated posterior interval.
 
 ## Interpretation limits
 
@@ -130,3 +155,50 @@ zero DEM phase component, and are stored as `NaN` in the DEM-error map.
 The repository also includes a real `16 x 16` HFT-473 MintPy fixture and a
 full-scene comparison for the highest-quality interferogram. See
 [`TESTING.md`](TESTING.md) for reproducible commands and expected results.
+
+## Synthetic benchmark
+
+Generate a multi-temporal MintPy stack with known DEM-error truth, run all
+classic models, compute truth-based metrics, and draw DEM/interferogram
+comparison figures:
+
+```bash
+python run_synthetic_dem_benchmark.py -o synthetic_benchmark --overwrite
+```
+
+See [`SIMULATION.md`](SIMULATION.md) for the component model, controlled
+research scenarios, output structure, and publication-oriented experiment
+matrix.
+
+Run the five-terrain comparison and cross-terrain model ranking with:
+
+```bash
+python run_multi_terrain_benchmark.py -o multi_terrain_benchmark --overwrite
+```
+
+## Published-method reproductions
+
+Six literature methods are implemented in a separate numerical module so the
+existing production correction path remains unchanged. Run them on a MintPy
+stack with:
+
+```bash
+python run_published_models_on_mintpy.py \
+  test_data/HFT473_16x16/ifgramStack.h5 \
+  -g test_data/HFT473_16x16/geometryRadar.h5 \
+  --mask test_data/HFT473_16x16/maskTempCoh.h5 \
+  --models ica_2019 adaptive_ht_2021 pgdc_2025 \
+  -o published_dem_error_ifg --overwrite
+```
+
+Run the scenario-matched comparison against the current adaptive graph model:
+
+```bash
+python run_published_model_benchmark.py \
+  -o published_model_benchmark --size 18 --seed 20260713 --overwrite
+```
+
+See [`PUBLISHED_METHODS.md`](PUBLISHED_METHODS.md) for equations, reproduction
+status, limitations, output files, and references. In particular, the 2015
+fractal method is an adapted post-regularizer because a normal MintPy stack
+does not contain the interferometric magnitude required by the paper.
