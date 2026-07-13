@@ -21,6 +21,7 @@ c_m(p) = -4*pi/lambda * Bperp_m(p) / (R(p) * sin(theta(p)))
 | IGS-CMAES，2021 | `igs_cmaes_2021_equivalent` | equivalent | 保留作者代码的 RI-L1 目标、多尺度 IGS 和多初值逻辑；本环境未安装 `cma`，局部 CMA-ES 映射为有界 Powell 加逐级局部网格。 |
 | 相位梯度方向一致性，2025 | `pgdc_2025` | equivalent | 修改 Sobel、基线符号归一化和 GDC 检测按原式实现；Delaunay/KNN、相邻等时长干涉图组合、TPC 搜索及约束网平差按论文流程实现，组合配对和边界参考选择为工程等价映射。 |
 | 改进 SBAS 动态高度估计，2025 | `dynamic_height_2025` | strict | 对候选突变历元分别拟合前后 DEM 误差与线性形变率，以残差平方和最小选择时刻，输出前后 DEM、变化量和变化日期。 |
+| HOMA-DEM 分层混合专家，2026 | `hybrid_optimal_2026` | new hybrid | 以 Adaptive HT、Huber、ICA 为候选，使用动态 F 检验、PGDC 稀疏门控、IGS 缠绕仲裁和不确定度自适应图正则进行逐像元选择。 |
 
 `strict` 表示论文方程可直接映射到当前观测域；`equivalent` 表示核心目标和流程一致，但优化器或工程步骤不同；`adapted` 表示论文所需输入在 MintPy 栈中缺失或原问题域不同。
 
@@ -131,3 +132,5 @@ python run_published_model_benchmark.py \
 6. Li et al. Estimation of Surface Height Changes and Deformation Time Series With Improved SBAS-InSAR Technique. IEEE TGRS, 2025. [DOI](https://doi.org/10.1109/TGRS.2025.3615234)
 
 对应全文位于仓库 `reference_paper/`。论文全文受原出版协议约束，代码和说明只记录实现所需公式与复现决策，不重新分发提取后的全文文本。
+
+综合模型的完整定义见 [`HYBRID_OPTIMAL_2026.md`](HYBRID_OPTIMAL_2026.md)。

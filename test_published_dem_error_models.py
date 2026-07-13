@@ -208,6 +208,134 @@ class PublishedDemErrorModelsTest(unittest.TestCase):
         self.assertLess(corrected_rmse, initial_rmse)
         self.assertEqual(result.diagnostics["status"], "adapted")
 
+    def test_hybrid_combines_temporal_models_and_wrapped_fallback(self):
+        rng = np.random.default_rng(14)
+        size = 10
+        dates = [
+            (datetime(2020, 1, 1) + timedelta(days=36 * index)).strftime("%Y%m%d")
+            for index in range(10)
+        ]
+        pairs = [
+            (dates[left], dates[right])
+            for left in range(len(dates))
+            for right in range(left + 1, min(len(dates), left + 4))
+        ]
+        date_index = {date: index for index, date in enumerate(dates)}
+        acquisition_baseline = rng.normal(0.0, 240.0, len(dates))
+        coefficient_1d = np.asarray(
+            [
+                acquisition_baseline[date_index[slave]]
+                - acquisition_baseline[date_index[master]]
+                for master, slave in pairs
+            ]
+        ) * 0.0018
+        coefficient = np.broadcast_to(
+            coefficient_1d[:, None, None], (len(pairs), size, size)
+        )
+        rows, columns = np.mgrid[:size, :size]
+        dem_error = 8.0 * np.sin(columns / 2.5) - 5.0 * np.cos(rows / 3.0)
+        years = np.arange(len(dates)) * 36.0 / 365.25
+        velocity = 0.6 * np.sin(rows / 3.0)
+        acceleration = 0.3 * np.cos(columns / 3.0)
+        acquisition_phase = years[:, None, None] * velocity
+        acquisition_phase += 0.5 * years[:, None, None] ** 2 * acceleration
+        phase = np.asarray(
+            [
+                acquisition_phase[date_index[slave]]
+                - acquisition_phase[date_index[master]]
+                for master, slave in pairs
+            ]
+        )
+        phase += coefficient * dem_error
+        phase += rng.normal(0.0, 0.01, phase.shape)
+        unwrap_region = (rows - 5) ** 2 + (columns - 5) ** 2 <= 6
+        for interferogram_index in (3, 11):
+            phase[interferogram_index, unwrap_region] += 2.0 * np.pi
+        wrapped = np.angle(np.exp(1j * phase))
+
+        result = models.hybrid_optimal_2026(
+            phase,
+            coefficient,
+            pairs,
+            np.full_like(phase, 0.9),
+            wrapped_phase=wrapped,
+            terrain=np.zeros((size, size)),
+            velocity_bounds=(-4.0, 4.0),
+            dem_bounds=(-60.0, 60.0),
+        )
+
+        rmse = np.sqrt(np.nanmean((result.dem_error - dem_error) ** 2))
+        self.assertLess(rmse, 0.25)
+        self.assertGreater(result.diagnostics["igs"]["candidate_pixels"], 0)
+        self.assertGreater(result.diagnostics["igs"]["arbitrated_pixels"], 0)
+        self.assertFalse(np.any(result.diagnostics["dynamic_mask"]))
+
+    def test_hybrid_selects_true_dynamic_height_region(self):
+        rng = np.random.default_rng(18)
+        size = 8
+        dates = [f"2020{month:02d}01" for month in range(1, 11)]
+        pairs = [
+            (dates[left], dates[right])
+            for left in range(len(dates))
+            for right in range(left + 1, min(len(dates), left + 4))
+        ]
+        date_index = {date: index for index, date in enumerate(dates)}
+        acquisition_baseline = rng.normal(0.0, 220.0, len(dates))
+        acquisition_coefficient = 0.002 * acquisition_baseline
+        coefficient_1d = np.asarray(
+            [
+                acquisition_coefficient[date_index[slave]]
+                - acquisition_coefficient[date_index[master]]
+                for master, slave in pairs
+            ]
+        )
+        coefficient = np.broadcast_to(
+            coefficient_1d[:, None, None], (len(pairs), size, size)
+        )
+        before = np.zeros((size, size))
+        height_change = np.zeros_like(before)
+        height_change[2:6, 3:6] = 14.0
+        after = before + height_change
+        change_index = 5
+        phase = np.empty_like(coefficient)
+        for pair_index, (master, slave) in enumerate(pairs):
+            master_index = date_index[master]
+            slave_index = date_index[slave]
+            if slave_index < change_index:
+                topographic = coefficient_1d[pair_index] * before
+            elif master_index >= change_index:
+                topographic = coefficient_1d[pair_index] * after
+            else:
+                topographic = (
+                    acquisition_coefficient[slave_index] * after
+                    - acquisition_coefficient[master_index] * before
+                )
+            phase[pair_index] = topographic
+        phase += rng.normal(0.0, 0.005, phase.shape)
+
+        result = models.hybrid_optimal_2026(
+            phase,
+            coefficient,
+            pairs,
+            np.full_like(phase, 0.92),
+            terrain=np.zeros((size, size)),
+            velocity_bounds=(-2.0, 2.0),
+            dem_bounds=(-40.0, 40.0),
+        )
+
+        estimated_change = result.diagnostics["height_change"]
+        rmse = np.sqrt(np.mean((estimated_change - height_change) ** 2))
+        self.assertLess(rmse, 0.1)
+        np.testing.assert_array_equal(
+            result.diagnostics["dynamic_mask"], height_change != 0
+        )
+        self.assertTrue(
+            np.all(
+                result.diagnostics["change_index"][height_change != 0]
+                == change_index
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import combinations
 from typing import Any
+import warnings
 
 import numpy as np
 from scipy import ndimage, sparse, stats
@@ -19,6 +20,9 @@ from scipy.optimize import minimize
 from scipy.sparse.linalg import spsolve
 from scipy.spatial import Delaunay, QhullError, cKDTree
 from sklearn.decomposition import FastICA
+from sklearn.exceptions import ConvergenceWarning
+
+import mintpy_dem_error_ifg as current
 
 
 @dataclass
@@ -1026,4 +1030,575 @@ def fractal_surface_regularize_2015_adapted(
             "azimuth_kernel": [0.1, 0.8, 0.1],
             "limitation": "magnitude_proxy is not the interferometric magnitude required by the paper",
         },
+    )
+
+
+def _robust_profile_score(
+    phase: np.ndarray,
+    dem_coefficient: np.ndarray,
+    dem_error: np.ndarray,
+    deformation_design: np.ndarray,
+    weights: np.ndarray,
+    huber_delta: float = 1.345,
+    huber_iterations: int = 6,
+    rcond: float = 1e-8,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Profile deformation parameters and return BIC, RI-L1, and cycle fraction."""
+
+    phase = np.asarray(phase, dtype=np.float64)
+    coefficient = np.asarray(dem_coefficient, dtype=np.float64)
+    estimate = np.asarray(dem_error, dtype=np.float64).reshape(-1)
+    base_weights = np.asarray(weights, dtype=np.float64)
+    observations = (phase - coefficient * estimate[None, :]).T
+    num_pixel, num_ifgram = observations.shape
+    num_parameter = deformation_design.shape[1]
+    design = np.broadcast_to(
+        np.asarray(deformation_design, dtype=np.float64)[None, :, :],
+        (num_pixel, num_ifgram, num_parameter),
+    ).copy()
+    finite = (
+        np.isfinite(observations)
+        & np.isfinite(base_weights.T)
+        & np.isfinite(estimate)[:, None]
+    )
+    current_weights = np.where(finite & (base_weights.T > 0), base_weights.T, 0.0)
+    observations = np.where(finite, observations, 0.0)
+    design = np.where(finite[:, :, None], design, 0.0)
+    solution, valid = current.solve_weighted(
+        design, observations, current_weights, rcond
+    )
+    robust_pixels = np.flatnonzero(valid)
+    for _ in range(max(1, huber_iterations)):
+        if robust_pixels.size == 0:
+            break
+        prediction = np.einsum(
+            "pmq,pq->pm",
+            design[robust_pixels],
+            solution[robust_pixels],
+            optimize=True,
+        )
+        residual = observations[robust_pixels] - prediction
+        residual[current_weights[robust_pixels] <= 0] = np.nan
+        median = np.nanmedian(residual, axis=1, keepdims=True)
+        mad = np.nanmedian(np.abs(residual - median), axis=1, keepdims=True)
+        scale = np.maximum(1.4826 * mad, 1e-6)
+        ratio = np.abs(residual) / (huber_delta * scale)
+        huber_weight = np.ones_like(ratio)
+        large = ratio > 1.0
+        huber_weight[large] = 1.0 / ratio[large]
+        huber_weight[~np.isfinite(huber_weight)] = 0.0
+        solved, solved_valid = current.solve_weighted(
+            design[robust_pixels],
+            observations[robust_pixels],
+            current_weights[robust_pixels] * huber_weight,
+            rcond,
+        )
+        solution[robust_pixels[solved_valid]] = solved[solved_valid]
+        valid[robust_pixels[~solved_valid]] = False
+        robust_pixels = np.flatnonzero(valid)
+
+    prediction = np.einsum(
+        "pmq,pq->pm", design, np.nan_to_num(solution), optimize=True
+    )
+    residual = observations - prediction
+    residual[current_weights <= 0] = np.nan
+    median = np.zeros((num_pixel, 1), dtype=np.float64)
+    mad = np.zeros((num_pixel, 1), dtype=np.float64)
+    active = np.any(current_weights > 0, axis=1) & valid
+    if np.any(active):
+        median[active] = np.nanmedian(residual[active], axis=1, keepdims=True)
+        mad[active] = np.nanmedian(
+            np.abs(residual[active] - median[active]), axis=1, keepdims=True
+        )
+    scale = np.maximum(1.4826 * mad, 1e-6)
+    ratio = np.abs(np.nan_to_num(residual)) / (huber_delta * scale)
+    huber_weight = np.ones_like(ratio)
+    large = ratio > 1.0
+    huber_weight[large] = 1.0 / ratio[large]
+    effective_weights = current_weights * huber_weight
+    count = np.sum(effective_weights > 0, axis=1)
+    rss = np.nansum(effective_weights * residual**2, axis=1)
+    bic = np.full(num_pixel, np.inf, dtype=np.float64)
+    score_valid = valid & (count > num_parameter)
+    bic[score_valid] = (
+        count[score_valid]
+        * np.log(np.maximum(rss[score_valid] / count[score_valid], 1e-15))
+        + num_parameter * np.log(count[score_valid])
+    )
+    circular_cost = np.abs(np.sin(np.nan_to_num(residual)))
+    circular_cost += np.abs(np.cos(np.nan_to_num(residual)) - 1.0)
+    ri_l1 = np.divide(
+        np.sum(current_weights * circular_cost, axis=1),
+        np.sum(current_weights, axis=1),
+        out=np.full(num_pixel, np.inf),
+        where=np.sum(current_weights, axis=1) > 0,
+    )
+    wrapped_residual = np.angle(np.exp(1j * np.nan_to_num(residual)))
+    cycle = np.abs(np.nan_to_num(residual) - wrapped_residual) > np.pi
+    cycle_fraction = np.divide(
+        np.sum(cycle & (current_weights > 0), axis=1),
+        np.sum(current_weights > 0, axis=1),
+        out=np.zeros(num_pixel),
+        where=np.sum(current_weights > 0, axis=1) > 0,
+    )
+    return bic, ri_l1, cycle_fraction
+
+
+def _select_dynamic_height_pixels(
+    phase: np.ndarray,
+    dem_coefficient: np.ndarray,
+    date_pairs: list[tuple[str, str]],
+    weights: np.ndarray,
+    dynamic: PublishedResult,
+    alpha: float,
+    minimum_height_change: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compare static and two-segment SBAS fits on identical nonspanning data."""
+
+    dates, date_index = _dates_and_indices(date_pairs)
+    years = _date_years(dates)
+    temporal = np.asarray(
+        [years[date_index[slave]] - years[date_index[master]] for master, slave in date_pairs]
+    )
+    change_index = np.asarray(dynamic.diagnostics["change_index"])
+    dynamic_rss = np.asarray(dynamic.diagnostics["rss"], dtype=np.float64)
+    change = np.asarray(dynamic.diagnostics["height_change"], dtype=np.float64)
+    f_statistic = np.zeros(phase.shape[1], dtype=np.float64)
+    selected = np.zeros(phase.shape[1], dtype=bool)
+
+    finite_change = change[np.isfinite(change)]
+    if finite_change.size:
+        center = float(np.median(finite_change))
+        change_scale = 1.4826 * float(np.median(np.abs(finite_change - center)))
+    else:
+        change_scale = np.inf
+    change_threshold = max(minimum_height_change, 3.0 * change_scale)
+
+    for pixel in np.flatnonzero(dynamic.valid):
+        candidate = int(change_index[pixel])
+        before = np.asarray(
+            [
+                date_index[master] < candidate and date_index[slave] < candidate
+                for master, slave in date_pairs
+            ]
+        )
+        after = np.asarray(
+            [
+                date_index[master] >= candidate and date_index[slave] >= candidate
+                for master, slave in date_pairs
+            ]
+        )
+        keep = (
+            (before | after)
+            & np.isfinite(phase[:, pixel])
+            & np.isfinite(dem_coefficient[:, pixel])
+            & np.isfinite(weights[:, pixel])
+            & (weights[:, pixel] > 0)
+        )
+        observation_count = int(np.sum(keep))
+        if observation_count <= 4 or not np.isfinite(dynamic_rss[pixel]):
+            continue
+        design = np.column_stack(
+            (dem_coefficient[keep, pixel], temporal[keep])
+        )
+        sqrt_weight = np.sqrt(weights[keep, pixel])
+        solution, _, rank, _ = np.linalg.lstsq(
+            design * sqrt_weight[:, None],
+            phase[keep, pixel] * sqrt_weight,
+            rcond=None,
+        )
+        if rank != 2:
+            continue
+        residual = phase[keep, pixel] - design @ solution
+        static_rss = float(np.sum(weights[keep, pixel] * residual**2))
+        improvement = max(static_rss - dynamic_rss[pixel], 0.0)
+        denominator = dynamic_rss[pixel] / max(observation_count - 4, 1)
+        f_value = (improvement / 2.0) / max(denominator, 1e-15)
+        f_statistic[pixel] = f_value
+        critical = stats.f.ppf(1.0 - alpha, 2, max(observation_count - 4, 1))
+        selected[pixel] = (
+            f_value > critical and abs(change[pixel]) >= change_threshold
+        )
+    return selected, f_statistic
+
+
+def hybrid_optimal_2026(
+    unwrapped_phase: np.ndarray,
+    dem_coefficient: np.ndarray,
+    date_pairs: list[tuple[str, str]],
+    coherence: np.ndarray | None = None,
+    wrapped_phase: np.ndarray | None = None,
+    terrain: np.ndarray | None = None,
+    min_coherence: float = 0.5,
+    pgdc_threshold: float = 0.5,
+    dynamic_alpha: float = 0.01,
+    minimum_height_change: float = 2.0,
+    graph_lambda: float = 1.0,
+    graph_iterations: int = 30,
+    unwrap_cycle_threshold: float = 0.02,
+    igs_max_fraction: float = 0.25,
+    velocity_bounds: tuple[float, float] = (-8.0, 8.0),
+    dem_bounds: tuple[float, float] = (-200.0, 200.0),
+) -> PublishedResult:
+    """Hierarchical mixture-of-experts DEM-error correction.
+
+    The method combines robust adaptive regression, hypothesis-tested temporal
+    models, ICA, PGDC detection, dynamic-height model selection, wrapped-phase
+    fallback, and uncertainty-adaptive terrain regularization.  It is an
+    optimization framework, not a claim of a globally optimal estimator.
+    """
+
+    phase_3d = np.asarray(unwrapped_phase, dtype=np.float64)
+    coefficient_3d = np.asarray(dem_coefficient, dtype=np.float64)
+    if phase_3d.ndim != 3 or coefficient_3d.shape != phase_3d.shape:
+        raise ValueError(
+            "unwrapped_phase and dem_coefficient must have shape (ifg, y, x)"
+        )
+    num_ifgram, length, width = phase_3d.shape
+    phase = phase_3d.reshape(num_ifgram, -1)
+    coefficient = coefficient_3d.reshape(num_ifgram, -1)
+    if coherence is None:
+        coherence_3d = np.ones_like(phase_3d)
+    else:
+        coherence_3d = np.broadcast_to(
+            np.asarray(coherence, dtype=np.float64), phase_3d.shape
+        )
+    weights = coherence_3d.reshape(num_ifgram, -1) ** 2
+    weights[coherence_3d.reshape(num_ifgram, -1) < min_coherence] = 0.0
+    if wrapped_phase is None:
+        wrapped_3d = np.angle(np.exp(1j * phase_3d))
+    else:
+        wrapped_3d = np.asarray(wrapped_phase, dtype=np.float64)
+        if wrapped_3d.shape != phase_3d.shape:
+            raise ValueError("wrapped_phase must match unwrapped_phase shape")
+    if terrain is None:
+        terrain_2d = np.zeros((length, width), dtype=np.float64)
+    else:
+        terrain_2d = np.asarray(terrain, dtype=np.float64)
+        if terrain_2d.shape != (length, width):
+            raise ValueError("terrain must match the spatial phase shape")
+
+    fit_ifgrams = np.ones(num_ifgram, dtype=bool)
+    robust_solution, robust_valid, information, dem_std, model_order, _ = (
+        current.solve_adaptive_model_block(
+            phase,
+            coefficient,
+            date_pairs,
+            fit_ifgrams,
+            weights,
+            periods=[1.0],
+            huber_iterations=8,
+        )
+    )
+    robust_dem = robust_solution[:, 0]
+    ht = adaptive_hypothesis_2021(phase, coefficient, date_pairs, weights)
+
+    linear_design, _ = current.build_deformation_design(date_pairs, 1)
+    linear_solution, linear_valid = current.solve_model_block(
+        phase,
+        coefficient,
+        linear_design,
+        fit_ifgrams,
+        weights,
+        robust=True,
+        huber_iterations=8,
+    )
+    linear_dem = linear_solution[:, 0]
+
+    candidate_names = ["adaptive_ht_2021", "adaptive_huber", "linear_huber"]
+    candidates = [ht.dem_error, robust_dem, linear_dem]
+    ica_diagnostics: dict[str, Any] = {"significant": False}
+    try:
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always", ConvergenceWarning)
+            ica = nonparametric_ica_2019(phase, coefficient, date_pairs, weights)
+        converged = not any(
+            issubclass(warning.category, ConvergenceWarning)
+            for warning in caught_warnings
+        )
+        ica_diagnostics = ica.diagnostics
+        ica_diagnostics["converged"] = converged
+        if converged and bool(ica.diagnostics.get("significant")) and abs(
+            float(ica.diagnostics.get("baseline_correlation", 0.0))
+        ) >= 0.7:
+            candidate_names.append("ica_2019")
+            candidates.append(ica.dem_error)
+    except (ValueError, RuntimeError, np.linalg.LinAlgError) as error:
+        ica_diagnostics = {"significant": False, "error": str(error)}
+
+    profile_design, _ = current.build_deformation_design(
+        date_pairs, 3, periods=[1.0]
+    )
+    candidate_scores = []
+    candidate_ri = []
+    candidate_cycles = []
+    for candidate in candidates:
+        score, ri_l1, cycle_fraction = _robust_profile_score(
+            phase,
+            coefficient,
+            candidate,
+            profile_design,
+            weights,
+        )
+        candidate_scores.append(score)
+        candidate_ri.append(ri_l1)
+        candidate_cycles.append(cycle_fraction)
+    score_stack = np.stack(candidate_scores)
+    source_index = np.argmin(score_stack, axis=0)
+    all_invalid = ~np.any(np.isfinite(score_stack), axis=0)
+    source_index[all_invalid] = 1
+    candidate_stack = np.stack(candidates)
+    temporal_candidate_indices = [
+        index for index, name in enumerate(candidate_names) if name != "ica_2019"
+    ]
+    temporal_candidates = candidate_stack[temporal_candidate_indices]
+    finite_temporal = np.isfinite(temporal_candidates)
+    any_temporal = np.any(finite_temporal, axis=0)
+    maximum_temporal = np.max(
+        np.where(finite_temporal, temporal_candidates, -np.inf), axis=0
+    )
+    minimum_temporal = np.min(
+        np.where(finite_temporal, temporal_candidates, np.inf), axis=0
+    )
+    candidate_spread = maximum_temporal - minimum_temporal
+    candidate_spread[~any_temporal] = np.nan
+    finite_spread = candidate_spread[np.isfinite(candidate_spread)]
+    if finite_spread.size:
+        spread_center = float(np.median(finite_spread))
+        spread_mad = 1.4826 * float(
+            np.median(np.abs(finite_spread - spread_center))
+        )
+        spread_threshold = max(0.1, spread_center + 6.0 * spread_mad)
+    else:
+        spread_threshold = np.inf
+    static_dem = np.take_along_axis(
+        candidate_stack, source_index[None, :], axis=0
+    )[0]
+    selected_ri = np.take_along_axis(
+        np.stack(candidate_ri), source_index[None, :], axis=0
+    )[0]
+    selected_cycles = np.take_along_axis(
+        np.stack(candidate_cycles), source_index[None, :], axis=0
+    )[0]
+    source_model = source_index.astype(np.uint8)
+
+    dynamic = dynamic_height_sbas_2025(
+        phase, coefficient, date_pairs, weights
+    )
+    dynamic_mask, dynamic_f = _select_dynamic_height_pixels(
+        phase,
+        coefficient,
+        date_pairs,
+        weights,
+        dynamic,
+        dynamic_alpha,
+        minimum_height_change,
+    )
+
+    dates, date_index = _dates_and_indices(date_pairs)
+    temporal_days = np.asarray(
+        [
+            (datetime.strptime(slave[:8], "%Y%m%d") - datetime.strptime(master[:8], "%Y%m%d")).days
+            for master, slave in date_pairs
+        ],
+        dtype=np.float64,
+    )
+    temporal_years = temporal_days / 365.25
+    baseline_proxy = np.nanmedian(coefficient, axis=1)
+    gdc, pgdc_detected, pgdc_ifgrams = pgdc_detect_2025(
+        wrapped_3d,
+        baseline_proxy,
+        temporal_days,
+        coherence_3d,
+        threshold=pgdc_threshold,
+    )
+
+    igs_mask = (
+        (
+            (selected_cycles > unwrap_cycle_threshold)
+            | (candidate_spread > spread_threshold)
+        )
+        & ~dynamic_mask
+        & np.isfinite(static_dem)
+    )
+    igs_candidates = np.flatnonzero(igs_mask)
+    triggered_igs_count = int(igs_candidates.size)
+    maximum_igs = max(1, int(np.ceil(igs_max_fraction * phase.shape[1])))
+    if igs_candidates.size > maximum_igs:
+        trigger_priority = np.maximum(
+            selected_cycles[igs_candidates]
+            / max(unwrap_cycle_threshold, 1e-8),
+            candidate_spread[igs_candidates] / max(spread_threshold, 1e-8),
+        )
+        order = np.argsort(trigger_priority)[::-1][:maximum_igs]
+        igs_candidates = igs_candidates[order]
+        igs_mask[:] = False
+        igs_mask[igs_candidates] = True
+    igs_selected = np.zeros(phase.shape[1], dtype=bool)
+    igs_diagnostics: dict[str, Any] = {
+        "triggered_pixels": triggered_igs_count,
+        "candidate_pixels": int(igs_candidates.size),
+    }
+    if igs_candidates.size:
+        igs = igs_cmaes_2021_equivalent(
+            wrapped_3d.reshape(num_ifgram, -1)[:, igs_candidates],
+            coefficient[:, igs_candidates],
+            temporal_years,
+            coherence_3d.reshape(num_ifgram, -1)[:, igs_candidates],
+            velocity_bounds=velocity_bounds,
+            dem_bounds=dem_bounds,
+            loss_threshold=0.3,
+        )
+        arbitration = (
+            igs.valid
+            & np.isfinite(igs.diagnostics["ri_l1"])
+            & (igs.diagnostics["ri_l1"] < 0.1)
+        )
+        if np.any(arbitration):
+            arbitration_pixels = igs_candidates[arbitration]
+            distances = np.abs(
+                candidate_stack[:, arbitration_pixels]
+                - igs.dem_error[arbitration][None, :]
+            )
+            nearest_source = np.argmin(distances, axis=0)
+            priority = [
+                candidate_names.index(name)
+                for name in (
+                    "linear_huber",
+                    "adaptive_ht_2021",
+                    "adaptive_huber",
+                    "ica_2019",
+                )
+                if name in candidate_names
+            ]
+            tolerance = 0.5 + 0.05 * np.abs(igs.dem_error[arbitration])
+            for output_index in range(arbitration_pixels.size):
+                for candidate_index in priority:
+                    if distances[candidate_index, output_index] <= tolerance[output_index]:
+                        nearest_source[output_index] = candidate_index
+                        break
+            static_dem[arbitration_pixels] = candidate_stack[
+                nearest_source, arbitration_pixels
+            ]
+            source_model[arbitration_pixels] = nearest_source.astype(np.uint8)
+        accept = (
+            igs.valid
+            & np.isfinite(igs.diagnostics["ri_l1"])
+            & (
+                igs.diagnostics["ri_l1"] + 0.005
+                < selected_ri[igs_candidates]
+            )
+        )
+        accepted_pixels = igs_candidates[accept]
+        static_dem[accepted_pixels] = igs.dem_error[accept]
+        source_model[accepted_pixels] = len(candidate_names)
+        igs_selected[accepted_pixels] = True
+        igs_diagnostics.update(
+            {
+                "accepted_pixels": int(np.sum(accept)),
+                "arbitrated_pixels": int(np.sum(arbitration)),
+                "mean_ri_l1": float(np.nanmean(igs.diagnostics["ri_l1"])),
+                "mean_objective_evaluations": float(
+                    np.nanmean(igs.diagnostics["objective_evaluations"])
+                ),
+            }
+        )
+
+    valid_static = (
+        np.isfinite(static_dem)
+        & np.isfinite(information)
+        & (information > 0)
+        & np.isfinite(terrain_2d.reshape(-1))
+    )
+    graph_dem, observability = current.terrain_graph_regularize(
+        static_dem.reshape(length, width),
+        information.reshape(length, width),
+        terrain_2d,
+        valid_static.reshape(length, width),
+        regularization=graph_lambda,
+        iterations=graph_iterations,
+    )
+    finite_std = dem_std[np.isfinite(dem_std) & (dem_std > 0)]
+    median_std = float(np.median(finite_std)) if finite_std.size else 1.0
+    uncertainty_ratio = np.divide(
+        dem_std,
+        max(median_std, 1e-8),
+        out=np.ones_like(dem_std),
+        where=np.isfinite(dem_std),
+    )
+    graph_blend = np.clip((uncertainty_ratio - 1.5) / 3.0, 0.0, 0.35)
+    graph_blend[igs_mask | igs_selected] = 0.0
+    graph_flat = graph_dem.reshape(-1)
+    regularized_static = static_dem.copy()
+    blend_valid = valid_static & np.isfinite(graph_flat)
+    regularized_static[blend_valid] = (
+        (1.0 - graph_blend[blend_valid]) * static_dem[blend_valid]
+        + graph_blend[blend_valid] * graph_flat[blend_valid]
+    )
+
+    significance = np.zeros_like(static_dem, dtype=bool)
+    finite_uncertainty = np.isfinite(dem_std) & (dem_std > 0)
+    significance[finite_uncertainty] = (
+        np.abs(regularized_static[finite_uncertainty])
+        >= 2.5 * dem_std[finite_uncertainty]
+    )
+    significance[~finite_uncertainty] = np.abs(
+        regularized_static[~finite_uncertainty]
+    ) >= minimum_height_change
+    significant_fraction = float(np.mean(significance[valid_static])) if np.any(valid_static) else 0.0
+    detected_flat = pgdc_detected.reshape(-1)
+    sparse_mode = significant_fraction < 0.35
+    active_mask = valid_static.copy()
+    if sparse_mode:
+        active_mask &= detected_flat | significance | dynamic_mask | igs_selected
+        regularized_static[valid_static & ~active_mask] = 0.0
+
+    before_dem = regularized_static.copy()
+    after_dem = regularized_static.copy()
+    dynamic_before = np.asarray(dynamic.diagnostics["dem_error_before"])
+    dynamic_after = np.asarray(dynamic.diagnostics["dem_error_after"])
+    before_dem[dynamic_mask] = dynamic_before[dynamic_mask]
+    after_dem[dynamic_mask] = dynamic_after[dynamic_mask]
+    source_model[dynamic_mask] = len(candidate_names) + 1
+    final_valid = np.isfinite(after_dem) & (
+        robust_valid | ht.valid | linear_valid | dynamic_mask
+    )
+    after_dem[~final_valid] = np.nan
+    before_dem[~final_valid] = np.nan
+
+    source_names = candidate_names + ["igs_wrapped_fallback", "dynamic_height_2025"]
+    diagnostics = {
+        "reproduction_status": "new_hybrid",
+        "source_names": source_names,
+        "source_model": source_model.reshape(length, width),
+        "dem_error_before": before_dem.reshape(length, width),
+        "dem_error_after": after_dem.reshape(length, width),
+        "height_change": (after_dem - before_dem).reshape(length, width),
+        "dynamic_mask": dynamic_mask.reshape(length, width),
+        "dynamic_f_statistic": dynamic_f.reshape(length, width),
+        "change_index": np.asarray(dynamic.diagnostics["change_index"]).reshape(
+            length, width
+        ),
+        "deformation_model_order": model_order.reshape(length, width),
+        "dem_error_std": dem_std.reshape(length, width),
+        "dem_information": information.reshape(length, width),
+        "dem_observability": observability,
+        "graph_blend": graph_blend.reshape(length, width),
+        "gdc": gdc,
+        "pgdc_detected": pgdc_detected,
+        "pgdc_ifgrams": pgdc_ifgrams,
+        "active_mask": active_mask.reshape(length, width),
+        "sparse_mode": sparse_mode,
+        "significant_fraction": significant_fraction,
+        "unwrap_cycle_fraction": selected_cycles.reshape(length, width),
+        "candidate_spread": candidate_spread.reshape(length, width),
+        "candidate_spread_threshold": spread_threshold,
+        "igs": igs_diagnostics,
+        "ica": ica_diagnostics,
+        "acquisition_dates": dates,
+    }
+    return PublishedResult(
+        after_dem.reshape(length, width),
+        final_valid.reshape(length, width),
+        diagnostics,
     )

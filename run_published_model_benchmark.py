@@ -19,6 +19,7 @@ import published_dem_error_models as published
 
 
 METHOD_LABELS = {
+    "hybrid_optimal_2026": "Hybrid optimal (2026)",
     "linear_huber": "Linear Huber",
     "adaptive_vce_huber_graph": "Current adaptive graph",
     "ica_2019": "Nonparametric ICA (2019)",
@@ -293,6 +294,31 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
         extra={"mean_selected_terms": adaptive.diagnostics["mean_selected_terms"]},
     )
 
+    start = time.perf_counter()
+    hybrid_static = published.hybrid_optimal_2026(
+        phase.reshape(len(date_pairs), size, size),
+        coefficient.reshape(len(date_pairs), size, size),
+        date_pairs,
+        coherence.reshape(len(date_pairs), size, size),
+        terrain=terrain,
+        dem_bounds=(-80.0, 80.0),
+    )
+    runtime = time.perf_counter() - start
+    maps["static_hybrid"] = hybrid_static.dem_error
+    _append_result(
+        rows,
+        "static_nonlinear",
+        "hybrid_optimal_2026",
+        "new_hybrid",
+        truth,
+        hybrid_static.dem_error,
+        runtime,
+        extra={
+            "dynamic_pixels": int(np.sum(hybrid_static.diagnostics["dynamic_mask"])),
+            "sparse_mode": bool(hybrid_static.diagnostics["sparse_mode"]),
+        },
+    )
+
     # Wrapped linear scenario for the IGS objective.
     temporal_design, _ = current.build_deformation_design(date_pairs, 1)
     velocity = 1.1 * _normalize(gaussian_filter(rng.normal(size=(size, size)), size / 8.0)).reshape(-1)
@@ -300,6 +326,15 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
     clean_wrapped_phase = coefficient * wrapped_truth[None, :]
     clean_wrapped_phase += temporal_design[:, :1] @ velocity[None, :]
     noisy_unwrapped = clean_wrapped_phase + rng.normal(0.0, 0.02, clean_wrapped_phase.shape)
+    yy, xx = np.mgrid[:size, :size]
+    unwrap_region = (
+        ((xx - 0.56 * size) / (0.22 * size)) ** 2
+        + ((yy - 0.44 * size) / (0.17 * size)) ** 2
+        <= 1.0
+    )
+    for interferogram_index in (3, 11, 17):
+        if interferogram_index < noisy_unwrapped.shape[0]:
+            noisy_unwrapped[interferogram_index, unwrap_region.reshape(-1)] += 2.0 * np.pi
     wrapped = np.angle(np.exp(1j * noisy_unwrapped))
     start = time.perf_counter()
     igs = published.igs_cmaes_2021_equivalent(
@@ -339,6 +374,30 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
         wrapped_truth,
         wrapped_linear_huber,
         runtime,
+    )
+
+    start = time.perf_counter()
+    hybrid_wrapped = published.hybrid_optimal_2026(
+        noisy_unwrapped.reshape(len(date_pairs), size, size),
+        coefficient.reshape(len(date_pairs), size, size),
+        date_pairs,
+        coherence.reshape(len(date_pairs), size, size),
+        wrapped_phase=wrapped.reshape(len(date_pairs), size, size),
+        terrain=terrain,
+        velocity_bounds=(-4.0, 4.0),
+        dem_bounds=(-80.0, 80.0),
+    )
+    runtime = time.perf_counter() - start
+    maps["wrapped_hybrid"] = hybrid_wrapped.dem_error
+    _append_result(
+        rows,
+        "wrapped_linear",
+        "hybrid_optimal_2026",
+        "new_hybrid",
+        wrapped_truth,
+        hybrid_wrapped.dem_error,
+        runtime,
+        extra=hybrid_wrapped.diagnostics["igs"],
     )
 
     # Sparse DEM-error scenario for PGDC detection and network estimation.
@@ -410,6 +469,34 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
         sparse_truth,
         sparse_graph,
         runtime,
+    )
+
+    start = time.perf_counter()
+    hybrid_sparse = published.hybrid_optimal_2026(
+        sparse_phase,
+        sparse_coefficient,
+        sparse_pairs,
+        np.full_like(sparse_phase, 0.9),
+        wrapped_phase=sparse_wrapped,
+        terrain=np.zeros((size, size)),
+        pgdc_threshold=0.4,
+        velocity_bounds=(-4.0, 4.0),
+        dem_bounds=(-60.0, 60.0),
+    )
+    runtime = time.perf_counter() - start
+    maps["sparse_hybrid"] = hybrid_sparse.dem_error
+    _append_result(
+        rows,
+        "sparse_dem",
+        "hybrid_optimal_2026",
+        "new_hybrid",
+        sparse_truth,
+        hybrid_sparse.dem_error,
+        runtime,
+        extra={
+            "sparse_mode": bool(hybrid_sparse.diagnostics["sparse_mode"]),
+            "active_pixels": int(np.sum(hybrid_sparse.diagnostics["active_mask"])),
+        },
     )
 
     # Dynamic surface-height scenario.
@@ -491,6 +578,41 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
         extra={"estimated_static_dem_rmse_after_m": _metrics(after_truth, dynamic_static)["rmse_m"]},
     )
 
+    start = time.perf_counter()
+    hybrid_dynamic = published.hybrid_optimal_2026(
+        dynamic_phase.reshape(len(dynamic_pairs), size, size),
+        dynamic_coefficient.reshape(len(dynamic_pairs), size, size),
+        dynamic_pairs,
+        np.full((len(dynamic_pairs), size, size), 0.9),
+        terrain=terrain,
+        velocity_bounds=(-4.0, 4.0),
+        dem_bounds=(-80.0, 80.0),
+    )
+    runtime = time.perf_counter() - start
+    maps["dynamic_hybrid"] = hybrid_dynamic.diagnostics["height_change"]
+    _append_result(
+        rows,
+        "dynamic_height",
+        "hybrid_optimal_2026",
+        "new_hybrid",
+        height_change,
+        hybrid_dynamic.diagnostics["height_change"],
+        runtime,
+        extra={
+            "dynamic_pixels": int(np.sum(hybrid_dynamic.diagnostics["dynamic_mask"])),
+            "mean_change_index_error": float(
+                np.mean(
+                    np.abs(
+                        hybrid_dynamic.diagnostics["change_index"][
+                            hybrid_dynamic.diagnostics["dynamic_mask"]
+                        ]
+                        - change_index
+                    )
+                )
+            ),
+        },
+    )
+
     # Fractal paper's single-image/magnitude domain is represented as a post-regularizer.
     spike_initial = graph.reshape(size, size) + rng.normal(0.0, 1.2, (size, size))
     spike_mask = rng.random((size, size)) < 0.035
@@ -552,16 +674,16 @@ def _plot_maps(maps: dict[str, np.ndarray], output_dir: Path) -> None:
     }
     panels = [
         ("static_truth", "Static truth", "RdBu_r", "static"),
-        ("static_graph", "Current adaptive graph", "RdBu_r", "static"),
-        ("static_ica", "ICA 2019", "RdBu_r", "static"),
+        ("static_hybrid", "Hybrid optimal 2026", "RdBu_r", "static"),
         ("static_adaptive", "Adaptive HT 2021", "RdBu_r", "static"),
+        ("static_ica", "ICA 2019", "RdBu_r", "static"),
         ("sparse_truth", "Sparse truth", "RdBu_r", "sparse"),
         ("sparse_gdc", "GDC detection score", "viridis", "gdc"),
         ("sparse_pgdc", "PGDC 2025", "RdBu_r", "sparse"),
-        ("sparse_graph", "Current adaptive graph", "RdBu_r", "sparse"),
+        ("sparse_hybrid", "Hybrid optimal 2026", "RdBu_r", "sparse"),
         ("dynamic_truth", "Height-change truth", "RdBu_r", "dynamic"),
         ("dynamic_estimate", "Dynamic SBAS 2025", "RdBu_r", "dynamic"),
-        ("dynamic_static", "Static-model height change", "RdBu_r", "dynamic"),
+        ("dynamic_hybrid", "Hybrid optimal 2026", "RdBu_r", "dynamic"),
         ("wrapped_igs", "IGS equivalent DEM", "RdBu_r", "wrapped"),
         ("static_truth", "Fractal target", "RdBu_r", "fractal"),
         ("fractal_initial", "Unregularized spikes", "RdBu_r", "fractal"),

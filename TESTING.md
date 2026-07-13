@@ -47,7 +47,9 @@ python -m unittest -v \
 The additional tests cover ICA source recovery and F testing, grouped adaptive
 hypothesis testing, wrapped RI-L1 optimization, PGDC detection/TPC network
 adjustment, dynamic height-change date search, and the adapted fractal
-regularizer.
+regularizer. They also verify that `hybrid_optimal_2026` invokes wrapped-phase
+arbitration for local cycle errors and selects the true dynamic-height region
+without creating changes in stable pixels.
 
 ## 2. Real 16 x 16 MintPy fixture
 

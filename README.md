@@ -202,3 +202,19 @@ See [`PUBLISHED_METHODS.md`](PUBLISHED_METHODS.md) for equations, reproduction
 status, limitations, output files, and references. In particular, the 2015
 fractal method is an adapted post-regularizer because a normal MintPy stack
 does not contain the interferometric magnitude required by the paper.
+
+The integrated `hybrid_optimal_2026` model combines the strongest applicable
+parts of the published methods using per-pixel statistical gates:
+
+```bash
+python run_published_models_on_mintpy.py \
+  test_data/HFT473_16x16/ifgramStack.h5 \
+  -g test_data/HFT473_16x16/geometryRadar.h5 \
+  --mask test_data/HFT473_16x16/maskTempCoh.h5 \
+  --models hybrid_optimal_2026 \
+  -o hybrid_dem_error_ifg --overwrite
+```
+
+See [`HYBRID_OPTIMAL_2026.md`](HYBRID_OPTIMAL_2026.md) for the model-selection
+equations, HDF5 diagnostics, benchmark results, ablation plan, and publication
+limitations.

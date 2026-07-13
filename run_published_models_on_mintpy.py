@@ -17,6 +17,7 @@ import published_dem_error_models as published
 
 
 METHODS = (
+    "hybrid_optimal_2026",
     "fractal_2015_adapted",
     "ica_2019",
     "adaptive_ht_2021",
@@ -43,6 +44,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pgdc-dem-step", type=float, default=1.0)
     parser.add_argument("--dem-bound", type=float, default=200.0)
     parser.add_argument("--velocity-bound", type=float, default=20.0)
+    parser.add_argument("--hybrid-graph-lambda", type=float, default=1.0)
+    parser.add_argument("--hybrid-dynamic-alpha", type=float, default=0.01)
+    parser.add_argument("--hybrid-min-height-change", type=float, default=2.0)
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -90,6 +94,27 @@ def _write_outputs(
         file.attrs["DEM_ERROR_MODEL"] = model
         file.create_dataset("demError", data=dem_error.astype(np.float32), compression="gzip")
         file.create_dataset("demPhase", data=dem_phase.astype(np.float32), compression="gzip")
+        diagnostic_datasets = {
+            "dem_error_before": "demErrorBefore",
+            "height_change": "heightChange",
+            "source_model": "sourceModel",
+            "dynamic_mask": "dynamicMask",
+            "change_index": "changeIndex",
+            "deformation_model_order": "deformationModelOrder",
+            "dem_error_std": "demErrorStd",
+            "dem_information": "demInformation",
+            "dem_observability": "demObservability",
+            "graph_blend": "graphBlend",
+            "gdc": "gdc",
+            "pgdc_detected": "pgdcDetected",
+            "active_mask": "activeMask",
+            "unwrap_cycle_fraction": "unwrapCycleFraction",
+            "candidate_spread": "candidateSpread",
+        }
+        for key, dataset_name in diagnostic_datasets.items():
+            value = diagnostics.get(key)
+            if isinstance(value, np.ndarray) and value.shape == dem_error.shape:
+                file.create_dataset(dataset_name, data=value, compression="gzip")
     diagnostics_path.write_text(
         json.dumps({key: _json_value(value) for key, value in diagnostics.items()}, indent=2),
         encoding="utf-8",
@@ -198,7 +223,28 @@ def run(args: argparse.Namespace) -> list[Path]:
 
             for model in args.models:
                 print(f"running {model}")
-                if model == "ica_2019":
+                if model == "hybrid_optimal_2026":
+                    result = published.hybrid_optimal_2026(
+                        fit_phase.reshape(np.sum(selected), length, width),
+                        fit_coefficient.reshape(np.sum(selected), length, width),
+                        fit_pairs,
+                        fit_coherence.reshape(np.sum(selected), length, width),
+                        wrapped_phase=fit_wrapped.reshape(
+                            np.sum(selected), length, width
+                        ),
+                        terrain=terrain,
+                        min_coherence=args.min_coherence,
+                        pgdc_threshold=args.pgdc_threshold,
+                        dynamic_alpha=args.hybrid_dynamic_alpha,
+                        minimum_height_change=args.hybrid_min_height_change,
+                        graph_lambda=args.hybrid_graph_lambda,
+                        velocity_bounds=(-args.velocity_bound, args.velocity_bound),
+                        dem_bounds=(-args.dem_bound, args.dem_bound),
+                    )
+                    result.dem_error = result.dem_error.reshape(-1)
+                    result.valid = result.valid.reshape(-1)
+                    status = "new_hybrid"
+                elif model == "ica_2019":
                     result = published.nonparametric_ica_2019(
                         fit_phase, fit_coefficient, fit_pairs, fit_weights
                     )
@@ -266,24 +312,33 @@ def run(args: argparse.Namespace) -> list[Path]:
 
                 dem_error = np.asarray(result.dem_error, dtype=np.float64).reshape(-1)
                 dem_error[~spatial_mask] = np.nan
-                if model == "dynamic_height_2025":
-                    before = result.diagnostics["dem_error_before"]
-                    after = result.diagnostics["dem_error_after"]
-                    change_index = result.diagnostics["change_index"]
-                    dem_phase = np.zeros_like(phase_flat)
+                if model in {"dynamic_height_2025", "hybrid_optimal_2026"}:
+                    before = np.asarray(result.diagnostics["dem_error_before"]).reshape(-1)
+                    after = np.asarray(result.diagnostics["dem_error_after"]).reshape(-1)
+                    change_index = np.asarray(result.diagnostics["change_index"]).reshape(-1)
+                    dynamic_pixels = (
+                        np.asarray(result.diagnostics["dynamic_mask"]).reshape(-1)
+                        if model == "hybrid_optimal_2026"
+                        else result.valid
+                    )
+                    dem_phase = coefficient * after[None, :]
                     spanning_count = 0
                     for ifgram_index, (master, slave) in enumerate(date_pairs):
                         master_index = date_lookup[master]
                         slave_index = date_lookup[slave]
-                        before_pixels = slave_index < change_index
-                        after_pixels = master_index >= change_index
+                        before_pixels = dynamic_pixels & (slave_index < change_index)
+                        after_pixels = dynamic_pixels & (master_index >= change_index)
+                        spanning_pixels = (
+                            dynamic_pixels & ~before_pixels & ~after_pixels
+                        )
                         dem_phase[ifgram_index, before_pixels] = (
                             coefficient[ifgram_index, before_pixels] * before[before_pixels]
                         )
                         dem_phase[ifgram_index, after_pixels] = (
                             coefficient[ifgram_index, after_pixels] * after[after_pixels]
                         )
-                        spanning_count += int(np.sum(~before_pixels & ~after_pixels & result.valid))
+                        dem_phase[ifgram_index, spanning_pixels] = 0.0
+                        spanning_count += int(np.sum(spanning_pixels & result.valid))
                     result.diagnostics["uncorrected_spanning_observations"] = spanning_count
                 else:
                     dem_phase = coefficient * dem_error[None, :]
