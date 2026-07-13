@@ -47,6 +47,8 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hybrid-graph-lambda", type=float, default=1.0)
     parser.add_argument("--hybrid-dynamic-alpha", type=float, default=0.01)
     parser.add_argument("--hybrid-min-height-change", type=float, default=2.0)
+    parser.add_argument("--hybrid-max-height-change", type=float, default=100.0)
+    parser.add_argument("--hybrid-min-dynamic-component", type=int, default=9)
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -237,6 +239,8 @@ def run(args: argparse.Namespace) -> list[Path]:
                         pgdc_threshold=args.pgdc_threshold,
                         dynamic_alpha=args.hybrid_dynamic_alpha,
                         minimum_height_change=args.hybrid_min_height_change,
+                        maximum_height_change=args.hybrid_max_height_change,
+                        minimum_dynamic_component_pixels=args.hybrid_min_dynamic_component,
                         graph_lambda=args.hybrid_graph_lambda,
                         velocity_bounds=(-args.velocity_bound, args.velocity_bound),
                         dem_bounds=(-args.dem_bound, args.dem_bound),

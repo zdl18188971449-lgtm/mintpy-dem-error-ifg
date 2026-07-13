@@ -1,0 +1,11 @@
+{
+  "ifgram_stack": "D:\\WSL\\ALOS\\mintpy-dem-error-ifg\\test_data\\HFT473_16x16\\ifgramStack.h5",
+  "geometry": "D:\\WSL\\ALOS\\mintpy-dem-error-ifg\\test_data\\HFT473_16x16\\geometryRadar.h5",
+  "mask": "D:\\WSL\\ALOS\\mintpy-dem-error-ifg\\test_data\\HFT473_16x16\\maskTempCoh.h5",
+  "folds": 5,
+  "selected_ifgrams": 26,
+  "mintpy_dem_reference": "D:\\WSL\\ALOS\\HFT-473\\Mintpy\\mintpy\\demErr.h5",
+  "lookup": "D:\\WSL\\ALOS\\HFT-473\\Mintpy\\mintpy\\inputs\\geometryGeo.h5",
+  "external_dem": "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N35_00_E103_00_DEM/Copernicus_DSM_COG_10_N35_00_E103_00_DEM.tif",
+  "external_offset_calibration": "checkerboard half-sample median; evaluated on disjoint half"
+}

@@ -29,6 +29,11 @@ METHOD_LABELS = {
     "dynamic_height_2025": "Dynamic height SBAS (2025)",
     "fractal_2015_adapted": "Fractal adapted (2015)",
     "initial_spike_map": "Unregularized estimate",
+    "homa_no_ica": "HOMA-DEM without ICA",
+    "homa_no_dynamic": "HOMA-DEM without dynamic branch",
+    "homa_no_pgdc": "HOMA-DEM without PGDC",
+    "homa_no_igs": "HOMA-DEM without IGS",
+    "homa_no_graph": "HOMA-DEM without graph regularization",
 }
 
 
@@ -230,7 +235,43 @@ def _append_result(
     rows.append(row)
 
 
-def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarray]]:
+def _append_hybrid_variants(
+    rows: list[dict],
+    scenario: str,
+    truth: np.ndarray,
+    call_args: tuple,
+    call_kwargs: dict,
+    variants: dict[str, dict[str, bool]] | None,
+    diagnostic_key: str | None = None,
+) -> None:
+    for method, switches in (variants or {}).items():
+        start = time.perf_counter()
+        result = published.hybrid_optimal_2026(
+            *call_args, **call_kwargs, **switches
+        )
+        runtime = time.perf_counter() - start
+        estimate = (
+            result.dem_error
+            if diagnostic_key is None
+            else result.diagnostics[diagnostic_key]
+        )
+        _append_result(
+            rows,
+            scenario,
+            method,
+            "ablation",
+            truth,
+            estimate,
+            runtime,
+            extra={"ablation_flags": result.diagnostics["ablation_flags"]},
+        )
+
+
+def run_benchmark(
+    size: int,
+    seed: int,
+    hybrid_variants: dict[str, dict[str, bool]] | None = None,
+) -> tuple[list[dict], dict[str, np.ndarray]]:
     rng = np.random.default_rng(seed)
     rows: list[dict] = []
     maps: dict[str, np.ndarray] = {}
@@ -318,6 +359,19 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
             "sparse_mode": bool(hybrid_static.diagnostics["sparse_mode"]),
         },
     )
+    _append_hybrid_variants(
+        rows,
+        "static_nonlinear",
+        truth,
+        (
+            phase.reshape(len(date_pairs), size, size),
+            coefficient.reshape(len(date_pairs), size, size),
+            date_pairs,
+            coherence.reshape(len(date_pairs), size, size),
+        ),
+        {"terrain": terrain, "dem_bounds": (-80.0, 80.0)},
+        hybrid_variants,
+    )
 
     # Wrapped linear scenario for the IGS objective.
     temporal_design, _ = current.build_deformation_design(date_pairs, 1)
@@ -400,6 +454,24 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
         hybrid_wrapped.dem_error,
         runtime,
         extra=hybrid_wrapped.diagnostics["igs"],
+    )
+    _append_hybrid_variants(
+        rows,
+        "wrapped_linear",
+        wrapped_truth,
+        (
+            noisy_unwrapped.reshape(len(date_pairs), size, size),
+            coefficient.reshape(len(date_pairs), size, size),
+            date_pairs,
+            coherence.reshape(len(date_pairs), size, size),
+        ),
+        {
+            "wrapped_phase": wrapped.reshape(len(date_pairs), size, size),
+            "terrain": terrain,
+            "velocity_bounds": (-4.0, 4.0),
+            "dem_bounds": (-80.0, 80.0),
+        },
+        hybrid_variants,
     )
 
     # Sparse DEM-error scenario for PGDC detection and network estimation.
@@ -499,6 +571,25 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
             "sparse_mode": bool(hybrid_sparse.diagnostics["sparse_mode"]),
             "active_pixels": int(np.sum(hybrid_sparse.diagnostics["active_mask"])),
         },
+    )
+    _append_hybrid_variants(
+        rows,
+        "sparse_dem",
+        sparse_truth,
+        (
+            sparse_phase,
+            sparse_coefficient,
+            sparse_pairs,
+            np.full_like(sparse_phase, 0.9),
+        ),
+        {
+            "wrapped_phase": sparse_wrapped,
+            "terrain": np.zeros((size, size)),
+            "pgdc_threshold": 0.4,
+            "velocity_bounds": (-4.0, 4.0),
+            "dem_bounds": (-60.0, 60.0),
+        },
+        hybrid_variants,
     )
 
     # Dynamic surface-height scenario.
@@ -613,6 +704,24 @@ def run_benchmark(size: int, seed: int) -> tuple[list[dict], dict[str, np.ndarra
                 )
             ),
         },
+    )
+    _append_hybrid_variants(
+        rows,
+        "dynamic_height",
+        height_change,
+        (
+            dynamic_phase.reshape(len(dynamic_pairs), size, size),
+            dynamic_coefficient.reshape(len(dynamic_pairs), size, size),
+            dynamic_pairs,
+            np.full((len(dynamic_pairs), size, size), 0.9),
+        ),
+        {
+            "terrain": terrain,
+            "velocity_bounds": (-4.0, 4.0),
+            "dem_bounds": (-80.0, 80.0),
+        },
+        hybrid_variants,
+        diagnostic_key="height_change",
     )
 
     # Fractal paper's single-image/magnitude domain is represented as a post-regularizer.

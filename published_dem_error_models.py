@@ -1152,6 +1152,8 @@ def _select_dynamic_height_pixels(
     dynamic: PublishedResult,
     alpha: float,
     minimum_height_change: float,
+    maximum_height_change: float,
+    dem_bounds: tuple[float, float],
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compare static and two-segment SBAS fits on identical nonspanning data."""
 
@@ -1163,6 +1165,8 @@ def _select_dynamic_height_pixels(
     change_index = np.asarray(dynamic.diagnostics["change_index"])
     dynamic_rss = np.asarray(dynamic.diagnostics["rss"], dtype=np.float64)
     change = np.asarray(dynamic.diagnostics["height_change"], dtype=np.float64)
+    dynamic_before = np.asarray(dynamic.diagnostics["dem_error_before"])
+    dynamic_after = np.asarray(dynamic.diagnostics["dem_error_after"])
     f_statistic = np.zeros(phase.shape[1], dtype=np.float64)
     selected = np.zeros(phase.shape[1], dtype=bool)
 
@@ -1217,9 +1221,41 @@ def _select_dynamic_height_pixels(
         f_statistic[pixel] = f_value
         critical = stats.f.ppf(1.0 - alpha, 2, max(observation_count - 4, 1))
         selected[pixel] = (
-            f_value > critical and abs(change[pixel]) >= change_threshold
+            f_value > critical
+            and change_threshold <= abs(change[pixel]) <= maximum_height_change
+            and dem_bounds[0] <= dynamic_before[pixel] <= dem_bounds[1]
+            and dem_bounds[0] <= dynamic_after[pixel] <= dem_bounds[1]
         )
     return selected, f_statistic
+
+
+def _filter_dynamic_components(
+    selected: np.ndarray,
+    height_change: np.ndarray,
+    shape: tuple[int, int],
+    minimum_pixels: int,
+    minimum_height_change: float,
+) -> np.ndarray:
+    if minimum_pixels <= 1:
+        return np.asarray(selected, dtype=bool)
+    labels, count = ndimage.label(
+        np.asarray(selected, dtype=bool).reshape(shape),
+        structure=np.ones((3, 3), dtype=bool),
+    )
+    filtered = np.zeros(shape, dtype=bool)
+    change = np.asarray(height_change, dtype=np.float64).reshape(shape)
+    for component in range(1, count + 1):
+        component_mask = labels == component
+        if np.sum(component_mask) < minimum_pixels:
+            continue
+        values = change[component_mask]
+        center = float(np.median(values))
+        scale = 1.4826 * float(np.median(np.abs(values - center)))
+        tolerance = max(3.0 * scale, minimum_height_change)
+        consistent = component_mask & (np.abs(change - center) <= tolerance)
+        if np.sum(consistent) >= minimum_pixels:
+            filtered |= consistent
+    return filtered.reshape(-1)
 
 
 def hybrid_optimal_2026(
@@ -1233,12 +1269,19 @@ def hybrid_optimal_2026(
     pgdc_threshold: float = 0.5,
     dynamic_alpha: float = 0.01,
     minimum_height_change: float = 2.0,
+    maximum_height_change: float = 100.0,
+    minimum_dynamic_component_pixels: int = 9,
     graph_lambda: float = 1.0,
     graph_iterations: int = 30,
     unwrap_cycle_threshold: float = 0.02,
     igs_max_fraction: float = 0.25,
     velocity_bounds: tuple[float, float] = (-8.0, 8.0),
     dem_bounds: tuple[float, float] = (-200.0, 200.0),
+    enable_ica: bool = True,
+    enable_dynamic: bool = True,
+    enable_pgdc: bool = True,
+    enable_igs: bool = True,
+    enable_graph: bool = True,
 ) -> PublishedResult:
     """Hierarchical mixture-of-experts DEM-error correction.
 
@@ -1254,6 +1297,13 @@ def hybrid_optimal_2026(
         raise ValueError(
             "unwrapped_phase and dem_coefficient must have shape (ifg, y, x)"
         )
+    if maximum_height_change < minimum_height_change:
+        raise ValueError(
+            "maximum_height_change must be greater than or equal to "
+            "minimum_height_change"
+        )
+    if minimum_dynamic_component_pixels < 1:
+        raise ValueError("minimum_dynamic_component_pixels must be positive")
     num_ifgram, length, width = phase_3d.shape
     phase = phase_3d.reshape(num_ifgram, -1)
     coefficient = coefficient_3d.reshape(num_ifgram, -1)
@@ -1307,24 +1357,35 @@ def hybrid_optimal_2026(
 
     candidate_names = ["adaptive_ht_2021", "adaptive_huber", "linear_huber"]
     candidates = [ht.dem_error, robust_dem, linear_dem]
-    ica_diagnostics: dict[str, Any] = {"significant": False}
-    try:
-        with warnings.catch_warnings(record=True) as caught_warnings:
-            warnings.simplefilter("always", ConvergenceWarning)
-            ica = nonparametric_ica_2019(phase, coefficient, date_pairs, weights)
-        converged = not any(
-            issubclass(warning.category, ConvergenceWarning)
-            for warning in caught_warnings
-        )
-        ica_diagnostics = ica.diagnostics
-        ica_diagnostics["converged"] = converged
-        if converged and bool(ica.diagnostics.get("significant")) and abs(
-            float(ica.diagnostics.get("baseline_correlation", 0.0))
-        ) >= 0.7:
-            candidate_names.append("ica_2019")
-            candidates.append(ica.dem_error)
-    except (ValueError, RuntimeError, np.linalg.LinAlgError) as error:
-        ica_diagnostics = {"significant": False, "error": str(error)}
+    ica_diagnostics: dict[str, Any] = {
+        "significant": False,
+        "enabled": enable_ica,
+    }
+    if enable_ica:
+        try:
+            with warnings.catch_warnings(record=True) as caught_warnings:
+                warnings.simplefilter("always", ConvergenceWarning)
+                ica = nonparametric_ica_2019(
+                    phase, coefficient, date_pairs, weights
+                )
+            converged = not any(
+                issubclass(warning.category, ConvergenceWarning)
+                for warning in caught_warnings
+            )
+            ica_diagnostics = ica.diagnostics
+            ica_diagnostics["converged"] = converged
+            ica_diagnostics["enabled"] = True
+            if converged and bool(ica.diagnostics.get("significant")) and abs(
+                float(ica.diagnostics.get("baseline_correlation", 0.0))
+            ) >= 0.7:
+                candidate_names.append("ica_2019")
+                candidates.append(ica.dem_error)
+        except (ValueError, RuntimeError, np.linalg.LinAlgError) as error:
+            ica_diagnostics = {
+                "significant": False,
+                "enabled": True,
+                "error": str(error),
+            }
 
     profile_design, _ = current.build_deformation_design(
         date_pairs, 3, periods=[1.0]
@@ -1382,18 +1443,37 @@ def hybrid_optimal_2026(
     )[0]
     source_model = source_index.astype(np.uint8)
 
-    dynamic = dynamic_height_sbas_2025(
-        phase, coefficient, date_pairs, weights
-    )
-    dynamic_mask, dynamic_f = _select_dynamic_height_pixels(
-        phase,
-        coefficient,
-        date_pairs,
-        weights,
-        dynamic,
-        dynamic_alpha,
-        minimum_height_change,
-    )
+    if enable_dynamic:
+        dynamic = dynamic_height_sbas_2025(
+            phase, coefficient, date_pairs, weights
+        )
+        dynamic_mask, dynamic_f = _select_dynamic_height_pixels(
+            phase,
+            coefficient,
+            date_pairs,
+            weights,
+            dynamic,
+            dynamic_alpha,
+            minimum_height_change,
+            maximum_height_change,
+            dem_bounds,
+        )
+        dynamic_mask = _filter_dynamic_components(
+            dynamic_mask,
+            dynamic.diagnostics["height_change"],
+            (length, width),
+            minimum_dynamic_component_pixels,
+            minimum_height_change,
+        )
+        dynamic_before = np.asarray(dynamic.diagnostics["dem_error_before"])
+        dynamic_after = np.asarray(dynamic.diagnostics["dem_error_after"])
+        dynamic_change_index = np.asarray(dynamic.diagnostics["change_index"])
+    else:
+        dynamic_mask = np.zeros(phase.shape[1], dtype=bool)
+        dynamic_f = np.full(phase.shape[1], np.nan, dtype=np.float64)
+        dynamic_before = np.full(phase.shape[1], np.nan, dtype=np.float64)
+        dynamic_after = np.full(phase.shape[1], np.nan, dtype=np.float64)
+        dynamic_change_index = np.full(phase.shape[1], -1, dtype=np.int32)
 
     dates, date_index = _dates_and_indices(date_pairs)
     temporal_days = np.asarray(
@@ -1405,22 +1485,29 @@ def hybrid_optimal_2026(
     )
     temporal_years = temporal_days / 365.25
     baseline_proxy = np.nanmedian(coefficient, axis=1)
-    gdc, pgdc_detected, pgdc_ifgrams = pgdc_detect_2025(
-        wrapped_3d,
-        baseline_proxy,
-        temporal_days,
-        coherence_3d,
-        threshold=pgdc_threshold,
-    )
-
-    igs_mask = (
-        (
-            (selected_cycles > unwrap_cycle_threshold)
-            | (candidate_spread > spread_threshold)
+    if enable_pgdc:
+        gdc, pgdc_detected, pgdc_ifgrams = pgdc_detect_2025(
+            wrapped_3d,
+            baseline_proxy,
+            temporal_days,
+            coherence_3d,
+            threshold=pgdc_threshold,
         )
-        & ~dynamic_mask
-        & np.isfinite(static_dem)
-    )
+    else:
+        gdc = np.zeros((length, width), dtype=np.float64)
+        pgdc_detected = np.zeros((length, width), dtype=bool)
+        pgdc_ifgrams = np.asarray([], dtype=np.int64)
+
+    igs_mask = np.zeros(phase.shape[1], dtype=bool)
+    if enable_igs:
+        igs_mask = (
+            (
+                (selected_cycles > unwrap_cycle_threshold)
+                | (candidate_spread > spread_threshold)
+            )
+            & ~dynamic_mask
+            & np.isfinite(static_dem)
+        )
     igs_candidates = np.flatnonzero(igs_mask)
     triggered_igs_count = int(igs_candidates.size)
     maximum_igs = max(1, int(np.ceil(igs_max_fraction * phase.shape[1])))
@@ -1436,6 +1523,7 @@ def hybrid_optimal_2026(
         igs_mask[igs_candidates] = True
     igs_selected = np.zeros(phase.shape[1], dtype=bool)
     igs_diagnostics: dict[str, Any] = {
+        "enabled": enable_igs,
         "triggered_pixels": triggered_igs_count,
         "candidate_pixels": int(igs_candidates.size),
     }
@@ -1510,14 +1598,25 @@ def hybrid_optimal_2026(
         & (information > 0)
         & np.isfinite(terrain_2d.reshape(-1))
     )
-    graph_dem, observability = current.terrain_graph_regularize(
-        static_dem.reshape(length, width),
-        information.reshape(length, width),
-        terrain_2d,
-        valid_static.reshape(length, width),
-        regularization=graph_lambda,
-        iterations=graph_iterations,
-    )
+    if enable_graph:
+        graph_dem, observability = current.terrain_graph_regularize(
+            static_dem.reshape(length, width),
+            information.reshape(length, width),
+            terrain_2d,
+            valid_static.reshape(length, width),
+            regularization=graph_lambda,
+            iterations=graph_iterations,
+        )
+    else:
+        graph_dem = static_dem.reshape(length, width).copy()
+        observability = np.zeros((length, width), dtype=np.float64)
+        finite_information = information[np.isfinite(information) & (information > 0)]
+        information_scale = (
+            float(np.median(finite_information)) if finite_information.size else 1.0
+        )
+        observability.reshape(-1)[valid_static] = (
+            information[valid_static] / max(information_scale, 1e-15)
+        )
     finite_std = dem_std[np.isfinite(dem_std) & (dem_std > 0)]
     median_std = float(np.median(finite_std)) if finite_std.size else 1.0
     uncertainty_ratio = np.divide(
@@ -1527,6 +1626,8 @@ def hybrid_optimal_2026(
         where=np.isfinite(dem_std),
     )
     graph_blend = np.clip((uncertainty_ratio - 1.5) / 3.0, 0.0, 0.35)
+    if not enable_graph:
+        graph_blend[:] = 0.0
     graph_blend[igs_mask | igs_selected] = 0.0
     graph_flat = graph_dem.reshape(-1)
     regularized_static = static_dem.copy()
@@ -1555,8 +1656,6 @@ def hybrid_optimal_2026(
 
     before_dem = regularized_static.copy()
     after_dem = regularized_static.copy()
-    dynamic_before = np.asarray(dynamic.diagnostics["dem_error_before"])
-    dynamic_after = np.asarray(dynamic.diagnostics["dem_error_after"])
     before_dem[dynamic_mask] = dynamic_before[dynamic_mask]
     after_dem[dynamic_mask] = dynamic_after[dynamic_mask]
     source_model[dynamic_mask] = len(candidate_names) + 1
@@ -1576,9 +1675,7 @@ def hybrid_optimal_2026(
         "height_change": (after_dem - before_dem).reshape(length, width),
         "dynamic_mask": dynamic_mask.reshape(length, width),
         "dynamic_f_statistic": dynamic_f.reshape(length, width),
-        "change_index": np.asarray(dynamic.diagnostics["change_index"]).reshape(
-            length, width
-        ),
+        "change_index": dynamic_change_index.reshape(length, width),
         "deformation_model_order": model_order.reshape(length, width),
         "dem_error_std": dem_std.reshape(length, width),
         "dem_information": information.reshape(length, width),
@@ -1595,6 +1692,14 @@ def hybrid_optimal_2026(
         "candidate_spread_threshold": spread_threshold,
         "igs": igs_diagnostics,
         "ica": ica_diagnostics,
+        "ablation_flags": {
+            "ica": enable_ica,
+            "dynamic": enable_dynamic,
+            "pgdc": enable_pgdc,
+            "igs": enable_igs,
+            "graph": enable_graph,
+        },
+        "minimum_dynamic_component_pixels": minimum_dynamic_component_pixels,
         "acquisition_dates": dates,
     }
     return PublishedResult(

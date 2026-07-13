@@ -1,0 +1,56 @@
+{
+  "size": 18,
+  "replicates": 30,
+  "seeds": [
+    20260713,
+    20260714,
+    20260715,
+    20260716,
+    20260717,
+    20260718,
+    20260719,
+    20260720,
+    20260721,
+    20260722,
+    20260723,
+    20260724,
+    20260725,
+    20260726,
+    20260727,
+    20260728,
+    20260729,
+    20260730,
+    20260731,
+    20260732,
+    20260733,
+    20260734,
+    20260735,
+    20260736,
+    20260737,
+    20260738,
+    20260739,
+    20260740,
+    20260741,
+    20260742
+  ],
+  "workers": 4,
+  "confidence_interval": "two-sided t interval for the mean, 95%",
+  "paired_design": true,
+  "ablation_variants": {
+    "homa_no_ica": {
+      "enable_ica": false
+    },
+    "homa_no_dynamic": {
+      "enable_dynamic": false
+    },
+    "homa_no_pgdc": {
+      "enable_pgdc": false
+    },
+    "homa_no_igs": {
+      "enable_igs": false
+    },
+    "homa_no_graph": {
+      "enable_graph": false
+    }
+  }
+}

@@ -270,6 +270,36 @@ class PublishedDemErrorModelsTest(unittest.TestCase):
         self.assertGreater(result.diagnostics["igs"]["arbitrated_pixels"], 0)
         self.assertFalse(np.any(result.diagnostics["dynamic_mask"]))
 
+        ablated = models.hybrid_optimal_2026(
+            phase,
+            coefficient,
+            pairs,
+            np.full_like(phase, 0.9),
+            wrapped_phase=wrapped,
+            terrain=np.zeros((size, size)),
+            velocity_bounds=(-4.0, 4.0),
+            dem_bounds=(-60.0, 60.0),
+            enable_ica=False,
+            enable_dynamic=False,
+            enable_pgdc=False,
+            enable_igs=False,
+            enable_graph=False,
+        )
+        self.assertEqual(
+            ablated.diagnostics["ablation_flags"],
+            {
+                "ica": False,
+                "dynamic": False,
+                "pgdc": False,
+                "igs": False,
+                "graph": False,
+            },
+        )
+        self.assertEqual(ablated.diagnostics["igs"]["candidate_pixels"], 0)
+        self.assertFalse(np.any(ablated.diagnostics["dynamic_mask"]))
+        self.assertFalse(np.any(ablated.diagnostics["pgdc_detected"]))
+        self.assertFalse(np.any(ablated.diagnostics["graph_blend"]))
+
     def test_hybrid_selects_true_dynamic_height_region(self):
         rng = np.random.default_rng(18)
         size = 8
@@ -335,6 +365,35 @@ class PublishedDemErrorModelsTest(unittest.TestCase):
                 == change_index
             )
         )
+
+        bounded = models.hybrid_optimal_2026(
+            phase,
+            coefficient,
+            pairs,
+            np.full_like(phase, 0.92),
+            terrain=np.zeros((size, size)),
+            velocity_bounds=(-2.0, 2.0),
+            dem_bounds=(-40.0, 40.0),
+            maximum_height_change=10.0,
+        )
+        self.assertFalse(np.any(bounded.diagnostics["dynamic_mask"]))
+
+    def test_dynamic_component_filter_rejects_small_and_inconsistent_regions(self):
+        selected = np.zeros((5, 5), dtype=bool)
+        selected[0, 0:2] = True
+        selected[2, 1:5] = True
+        change = np.zeros((5, 5), dtype=np.float64)
+        change[0, 0:2] = 12.0
+        change[2, 1:4] = 15.0
+        change[2, 4] = 90.0
+
+        filtered = models._filter_dynamic_components(
+            selected.reshape(-1), change.reshape(-1), selected.shape, 3, 2.0
+        ).reshape(selected.shape)
+
+        self.assertFalse(np.any(filtered[0]))
+        self.assertTrue(np.all(filtered[2, 1:4]))
+        self.assertFalse(filtered[2, 4])
 
 
 if __name__ == "__main__":

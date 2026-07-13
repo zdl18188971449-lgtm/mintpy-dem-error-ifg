@@ -91,6 +91,8 @@ python run_published_models_on_mintpy.py \
   --hybrid-graph-lambda 1 \
   --hybrid-dynamic-alpha 0.01 \
   --hybrid-min-height-change 2 \
+  --hybrid-max-height-change 100 \
+  --hybrid-min-dynamic-component 9 \
   -o hybrid_dem_error_ifg \
   --overwrite
 ```

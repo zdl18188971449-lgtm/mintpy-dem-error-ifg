@@ -228,3 +228,29 @@ python plot_tgrs_hybrid_comparison.py published_model_benchmark --dpi 600
 See [`TGRS_FIGURE_NOTES.md`](TGRS_FIGURE_NOTES.md) for manuscript-ready
 captions, method differences, quantitative interpretation, and validation
 limits.
+
+## Statistical and real-data validation
+
+Run 30 paired simulations with 95% confidence intervals and module ablations:
+
+```bash
+python run_homa_statistical_validation.py \
+  -o homa_statistical_validation --replicates 30 \
+  --seed-start 20260713 --size 18 --workers 4 --dpi 600 --overwrite
+```
+
+Run connected-network interferogram holdout validation and, when an independent
+georeferenced DEM/DSM is available, external elevation validation:
+
+```bash
+python validate_homa_real_data.py \
+  test_data/HFT473_16x16/ifgramStack.h5 \
+  -g test_data/HFT473_16x16/geometryRadar.h5 \
+  --mask test_data/HFT473_16x16/maskTempCoh.h5 \
+  --lookup /path/to/geometryGeo.h5 \
+  --external-dem /path/to/external_dem.tif \
+  -o homa_real_validation --folds 5 --dpi 600 --overwrite
+```
+
+See [`VALIDATION.md`](VALIDATION.md) for the exact evaluation protocol, output
+tables, Copernicus GLO-30 example, negative results, and publication limits.
