@@ -1,0 +1,5 @@
+model,poly_order,solver,phase_velocity,num_parameters,valid_dem_pixels,dem_error_mean_m,dem_error_std_m,mean_model_residual_rms_rad,corrected_stack,component_file
+linear_ols,1,ols,0,2,256,-1.7603199544241002,2.357782732953281,1.1824547001999244,ifgramStack_demErr_linear_ols.h5,demComponent_linear_ols.h5
+quadratic_ols,2,ols,0,3,256,-1.8940575490221012,2.4055827772076888,1.1766402944562744,ifgramStack_demErr_quadratic_ols.h5,demComponent_quadratic_ols.h5
+linear_wls,1,coherence,0,2,256,0.48431044229496995,2.075205474259146,1.2189419127720915,ifgramStack_demErr_linear_wls.h5,demComponent_linear_wls.h5
+linear_huber,1,huber,0,2,256,-1.2541813224458638,2.341828413016589,1.179681888611316,ifgramStack_demErr_linear_huber.h5,demComponent_linear_huber.h5

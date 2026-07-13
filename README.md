@@ -126,3 +126,7 @@ zero DEM phase component, and are stored as `NaN` in the DEM-error map.
 /home/zdl/miniforge3/envs/SAR/bin/python \
   /mnt/d/WSL/ALOS/Scripts/test_mintpy_dem_error_ifg.py
 ```
+
+The repository also includes a real `16 x 16` HFT-473 MintPy fixture and a
+full-scene comparison for the highest-quality interferogram. See
+[`TESTING.md`](TESTING.md) for reproducible commands and expected results.
