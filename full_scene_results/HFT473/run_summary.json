@@ -1,0 +1,68 @@
+{
+  "stack": "D:\\WSL\\ALOS\\HFT-473\\Mintpy\\mintpy\\inputs\\ifgramStack.h5",
+  "geometry": "D:\\WSL\\ALOS\\HFT-473\\Mintpy\\mintpy\\inputs\\geometryRadar.h5",
+  "mask": "D:\\WSL\\ALOS\\HFT-473\\Mintpy\\mintpy\\maskTempCoh.h5",
+  "shape": [
+    3036,
+    2484
+  ],
+  "tiles": 95,
+  "processing_runtime_s": 1280.5886888999994,
+  "profile": {
+    "min_coherence": 0.5,
+    "dem_bound": 200.0,
+    "velocity_bound": 20.0,
+    "graph_lambda": 1.0,
+    "graph_iterations": 30,
+    "block_rows": 32,
+    "halo_rows": 8,
+    "workers": 8,
+    "enable_ica": false,
+    "enable_dynamic": false,
+    "enable_igs": false,
+    "enable_pgdc": true,
+    "enable_graph": true
+  },
+  "timeseries_metrics": {
+    "dem_homa_minus_mintpy_median_m": 1.4468823671340942,
+    "dem_homa_mintpy_centered_rmse_m": 3.1341898441314697,
+    "dem_homa_mintpy_centered_mae_m": 2.1775577068328857,
+    "velocity_homa_mintpy_rmse_m_per_year": 0.0037532123043607225,
+    "velocity_comparison_pixels": 7541424
+  },
+  "scale_metrics": {
+    "raw_global_scale": 0.8231820202324622,
+    "applied_global_scale": 0.8231820202324622,
+    "weighted_rms_before_rad": 0.9169593682705417,
+    "weighted_rms_after_rad": 0.8219967539794907,
+    "weighted_rms_ratio": 0.8964374894057104,
+    "unclipped_per_ifgram_scale": [
+      0.3714910291886227,
+      0.5244054520955551,
+      0.7541585475271808,
+      0.7379929097787581,
+      0.726269274161689,
+      1.0371866271727612,
+      1.8629716621826145,
+      1.0302726958527357,
+      0.7646883185022079,
+      0.5845115207908613,
+      0.578842193132877,
+      0.66522458597212,
+      0.471273836727981,
+      0.6559885798567636,
+      0.5959718444171579,
+      1.0356047344271089,
+      0.5639403414036909,
+      0.9674671917913703,
+      1.2256668347898294,
+      1.373328910159785,
+      1.1120708817317178,
+      1.4126585740500495,
+      -0.18108240809042583,
+      0.5392930730474843,
+      0.8409531315252423,
+      0.9539203142161234
+    ]
+  }
+}

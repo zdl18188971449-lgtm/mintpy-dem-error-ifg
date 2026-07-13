@@ -254,3 +254,24 @@ python validate_homa_real_data.py \
 
 See [`VALIDATION.md`](VALIDATION.md) for the exact evaluation protocol, output
 tables, Copernicus GLO-30 example, negative results, and publication limits.
+
+## HFT-47 full-scene processing
+
+Apply the validation-driven static HOMA profile to a complete MintPy stack with
+overlapping row strips and a residual-safe global DEM scale:
+
+```bash
+python run_homa_full_scene.py \
+  /path/to/inputs/ifgramStack.h5 \
+  -g /path/to/inputs/geometryRadar.h5 \
+  --mask /path/to/maskTempCoh.h5 \
+  --mintpy-dem /path/to/demErr.h5 \
+  --timeseries-before /path/to/timeseries_tropHgt.h5 \
+  --timeseries-mintpy-corrected /path/to/timeseries_tropHgt_demErr.h5 \
+  -o /path/to/homa_dem_correction \
+  --block-rows 32 --halo-rows 8 --workers 8 --dpi 600 --overwrite
+```
+
+See [`HFT47_FULL_SCENE_RESULTS.md`](HFT47_FULL_SCENE_RESULTS.md) for the HFT-473
+and HFT-474 commands, output products, comparison figures, quantitative results,
+and the HFT-474 limited-observability warning.
