@@ -101,6 +101,81 @@ class MintPyCompatibleEstimatorTest(unittest.TestCase):
         self.assertEqual(residual.shape, clean.shape)
         self.assertGreater(np.min(np.abs(residual[5])), 1.9)
 
+    def test_batched_pixelwise_solver_matches_scalar_huber(self):
+        clean, design, tbase = self.synthetic_system()
+        observations = np.repeat(clean[:, :1], 7, axis=1)
+        geometry_scale = np.linspace(0.7, 1.3, observations.shape[1])
+        geometry = design[:, :1] * geometry_scale[None, :]
+        deformation = design[:, 1:]
+        parameters = np.column_stack(
+            (
+                np.linspace(12.0, 20.0, observations.shape[1]),
+                np.full(observations.shape[1], 0.003),
+                np.linspace(0.01, 0.03, observations.shape[1]),
+                np.linspace(-0.002, 0.004, observations.shape[1]),
+            )
+        )
+        observations = np.empty((design.shape[0], observations.shape[1]))
+        for pixel in range(observations.shape[1]):
+            pixel_design = np.column_stack((geometry[:, pixel], deformation))
+            observations[:, pixel] = pixel_design @ parameters[pixel]
+        observations[7, 2:6] += np.linspace(0.03, 0.09, 4)
+
+        expected = [[], [], []]
+        for pixel in range(observations.shape[1]):
+            pixel_design = np.column_stack((geometry[:, pixel], deformation))
+            result = MODULE.estimate_dem_error_huber(
+                observations[:, pixel],
+                pixel_design,
+                tbase,
+                max_iterations=8,
+            )
+            expected[0].append(result[0][0])
+            expected[1].append(result[1][:, 0])
+            expected[2].append(result[2][:, 0])
+        expected = (
+            np.asarray(expected[0]),
+            np.asarray(expected[1]).T,
+            np.asarray(expected[2]).T,
+        )
+        actual = MODULE.estimate_dem_error_huber_batch(
+            observations,
+            geometry,
+            deformation,
+            tbase,
+            max_iterations=8,
+            pixel_batch_size=3,
+        )
+        for expected_array, actual_array in zip(expected, actual):
+            np.testing.assert_allclose(actual_array, expected_array, rtol=2e-5, atol=2e-8)
+
+    def test_batched_pixelwise_ols_matches_scalar_lstsq(self):
+        rng = np.random.default_rng(19)
+        _, design, tbase = self.synthetic_system()
+        deformation = design[:, 1:]
+        geometry = design[:, :1] * np.linspace(0.6, 1.4, 9)[None, :]
+        observations = rng.normal(0.0, 0.02, (design.shape[0], geometry.shape[1]))
+        expected_dem = []
+        expected_corrected = []
+        expected_residual = []
+        for pixel in range(observations.shape[1]):
+            pixel_design = np.column_stack((geometry[:, pixel], deformation))
+            solution = np.linalg.lstsq(pixel_design, observations[:, pixel], rcond=1e-8)[0]
+            expected_dem.append(solution[0])
+            expected_corrected.append(observations[:, pixel] - pixel_design[:, 0] * solution[0])
+            expected_residual.append(observations[:, pixel] - pixel_design @ solution)
+        actual = MODULE.estimate_dem_error_huber_batch(
+            observations,
+            geometry,
+            deformation,
+            tbase,
+            max_iterations=0,
+            pixel_batch_size=4,
+        )
+        np.testing.assert_allclose(actual[0], expected_dem, rtol=2e-8, atol=2e-8)
+        np.testing.assert_allclose(actual[1], np.asarray(expected_corrected).T, atol=2e-10)
+        np.testing.assert_allclose(actual[2], np.asarray(expected_residual).T, atol=2e-10)
+
 
 if __name__ == "__main__":
     unittest.main()

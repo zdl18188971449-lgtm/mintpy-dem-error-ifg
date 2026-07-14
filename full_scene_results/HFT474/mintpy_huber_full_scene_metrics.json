@@ -1,0 +1,16 @@
+{
+  "valid_pixels": 4885802,
+  "num_dates": 10,
+  "dem_difference_mean_m": 2.560456587725601,
+  "dem_difference_rmse_m": 4.045984079009998,
+  "dem_difference_centered_rmse_m": 3.1327382958004923,
+  "residual_rms_ols_m": 0.010644687080408081,
+  "residual_rms_huber_m": 0.012226390584815332,
+  "residual_abs_median_ols_m": 0.0051581598818302155,
+  "residual_abs_median_huber_m": 0.0034927744418382645,
+  "residual_abs_p95_ols_m": 0.024485237337648857,
+  "residual_abs_p95_huber_m": 0.026084427349269353,
+  "velocity_difference_mean_mm_per_year": 0.013775303614549515,
+  "velocity_difference_rmse_mm_per_year": 0.021840574259099934,
+  "velocity_difference_centered_rmse_mm_per_year": 0.01694850124035274
+}

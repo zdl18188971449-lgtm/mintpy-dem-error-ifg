@@ -101,3 +101,10 @@ times lower than HFT-473 because of its smaller perpendicular-baseline span.
 Small displacement-fit changes can therefore produce large DEM changes. This
 pilot supports estimator isolation, but it is not sufficient evidence for a
 full-scene accuracy claim.
+
+## Full-scene rerun
+
+The strict workflow was subsequently run over both complete HFT-47 scenes with
+the batched Huber implementation. See
+[`HFT47_MINTPY_COMPATIBLE_HUBER_RESULTS.md`](HFT47_MINTPY_COMPATIBLE_HUBER_RESULTS.md)
+for runtime, products, full-scene metrics, figures, and interpretation.

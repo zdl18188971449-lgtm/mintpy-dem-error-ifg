@@ -154,6 +154,9 @@ MintPy's `correct_topography` step. See
 [`MINTPY_COMPATIBLE_WORKFLOW.md`](MINTPY_COMPATIBLE_WORKFLOW.md) for the HFT-47
 commands, equivalence contract, and validation criteria.
 
+Full-scene HFT-473/474 results from the estimator-only comparison are reported
+in [`HFT47_MINTPY_COMPATIBLE_HUBER_RESULTS.md`](HFT47_MINTPY_COMPATIBLE_HUBER_RESULTS.md).
+
 ## Tests
 
 ```bash
