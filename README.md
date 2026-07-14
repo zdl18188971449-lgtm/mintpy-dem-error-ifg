@@ -145,6 +145,15 @@ regularization; it is not yet a fully calibrated posterior interval.
   functions. Compare their DEM maps and independent validation errors; do not
   rank a weighted model only by its unweighted training RMS.
 
+## MintPy-compatible estimator comparison
+
+For a controlled comparison in which every processing step except the
+DEM-error estimator is identical to MintPy, use
+`mintpy_dem_error_timeseries.py` on the exact time-series input selected by
+MintPy's `correct_topography` step. See
+[`MINTPY_COMPATIBLE_WORKFLOW.md`](MINTPY_COMPATIBLE_WORKFLOW.md) for the HFT-47
+commands, equivalence contract, and validation criteria.
+
 ## Tests
 
 ```bash
